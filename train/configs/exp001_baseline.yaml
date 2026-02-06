@@ -1,0 +1,43 @@
+# Experiment 001: Baseline TransUNet
+# Based on train-vesuvius-surface-3d-detection-on-tpu_v3.ipynb
+
+experiment:
+  name: exp001_baseline
+  description: "Baseline TransUNet with SEResNeXt50 encoder"
+
+model:
+  architecture: transunet      # transunet or segformer
+  encoder: seresnext50         # transunet: seresnext50 / segformer: mit_b0, mit_b1, mit_b2
+
+training:
+  epochs: 2
+  batch_size: 1                # per GPU
+  learning_rate: 3.0e-4        # peak learning rate
+  weight_decay: 1.0e-5
+  warmup_ratio: 0.05           # warmup steps = total_steps * warmup_ratio
+
+data:
+  input_size: 128              # 160 or 128 (use 128 for less VRAM)
+  val_fold: -1                 # -1 means last TFRecord file
+  num_classes: 3               # 0: background, 1: surface, 2: ignore
+
+loss:
+  cldice_iters: 10             # centerline dice iterations
+  cldice_weight: 0.2           # loss = DiceCE + cldice_weight * clDice
+
+evaluation:
+  val_interval: 5              # validation every N epochs
+  eval_interval: 100           # competition metric evaluation every N epochs
+  overlap: 0.5                 # sliding window overlap ratio
+  surface_tolerance: 2.0       # surface dice tolerance (voxels)
+
+# Competition metric settings (topometrics)
+competition:
+  voi_connectivity: 26         # VOI connectivity (6, 18, or 26)
+  voi_transform: "one_over_one_plus"  # VOI transform function
+  voi_alpha: 0.3               # VOI alpha parameter
+  combine_weights:             # score = w1*topo + w2*surface_dice + w3*voi
+    topo: 0.30
+    surface_dice: 0.35
+    voi: 0.35
+  ignore_label: 2              # label to ignore in evaluation

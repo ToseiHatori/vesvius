@@ -1,0 +1,20 @@
+# Data files (download separately)
+data/
+tfrecords/
+competition_data/
+*.tfrec
+
+# Output
+output/
+*.json
+
+# Model weights (download separately)
+*.h5
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Docker
+.docker/

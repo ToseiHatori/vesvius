@@ -9,6 +9,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - KERAS_BACKEND=torch
       - NCCL_DEBUG=INFO
+      - PYTHONUNBUFFERED=1
     volumes:
       # Mount TFRecords (read-only)
       - ../eval/tfrecords:/workspace/tfrecords:ro

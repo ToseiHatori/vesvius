@@ -234,6 +234,37 @@ def create_dataset(tfrecord_files, input_shape, batch_size, is_train=True, cldic
 
 
 # =============================================================================
+# Epoch Logging Callback
+# =============================================================================
+class EpochLoggingCallback(Callback):
+    """Callback to log metrics at the end of each epoch and track history."""
+
+    def __init__(self, logger=None):
+        super().__init__()
+        self.logger = logger
+        self.epoch_history = []  # Store per-epoch metrics
+
+    def _log(self, msg):
+        if self.logger:
+            self.logger.info(msg)
+        else:
+            print(msg)
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        # Store epoch metrics
+        epoch_data = {
+            'epoch': epoch + 1,
+            **{k: float(v) for k, v in logs.items()}
+        }
+        self.epoch_history.append(epoch_data)
+
+        # Log to console/file
+        metrics_str = ", ".join([f"{k}: {v:.4f}" for k, v in logs.items()])
+        self._log(f"Epoch {epoch + 1} - {metrics_str}")
+
+
+# =============================================================================
 # Competition Metric Evaluation Callback
 # =============================================================================
 class CompetitionMetricCallback(Callback):
@@ -358,11 +389,8 @@ class CompetitionMetricCallback(Callback):
             self.evaluate_competition_metrics(epoch + 1)
 
     def on_train_end(self, logs=None):
-        # Save results history
-        import json
-        results_path = os.path.join(self.output_dir, 'competition_metrics.json')
-        with open(results_path, 'w') as f:
-            json.dump(self.results_history, f, indent=2)
+        # Results are now saved in comprehensive history.json
+        pass
 
 
 # =============================================================================
@@ -376,6 +404,8 @@ def main():
                         help='Path to TFRecords directory')
     parser.add_argument('--output', '-o', type=str, default='/workspace/experiments',
                         help='Base output directory')
+    parser.add_argument('--debug', action='store_true',
+                        help='Debug mode: 1 epoch, 1%% of data, all evaluations enabled')
 
     args = parser.parse_args()
 
@@ -434,6 +464,18 @@ def main():
     input_shape = (input_size, input_size, input_size)
 
     # ==========================================================================
+    # Debug Mode Overrides
+    # ==========================================================================
+    debug_mode = args.debug
+    if debug_mode:
+        logger.info("=" * 60)
+        logger.info("DEBUG MODE ENABLED")
+        logger.info("=" * 60)
+        epochs = 1
+        val_interval = 1      # Validate every epoch
+        eval_interval = 1     # Competition eval every epoch
+
+    # ==========================================================================
     # Setup GPU
     # ==========================================================================
     num_devices = torch.cuda.device_count()
@@ -444,7 +486,10 @@ def main():
         for i in range(num_devices):
             logger.info(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
 
-    total_batch_size = batch_size * max(num_devices, 1)
+    # Note: Keras with torch backend currently uses only 1 GPU
+    # TODO: Implement DataParallel for multi-GPU support
+    active_devices = 1
+    total_batch_size = batch_size * active_devices
 
     logger.info(f"Keras version: {keras.version()}")
     logger.info(f"Backend: {keras.config.backend()}")
@@ -475,6 +520,12 @@ def main():
         val_files = [all_tfrec[val_fold]]
         train_files = [f for i, f in enumerate(all_tfrec) if i != val_fold]
 
+    # Debug mode: use only ~1% of training data
+    if debug_mode:
+        num_debug_files = max(1, len(train_files) // 100)
+        train_files = train_files[:num_debug_files]
+        logger.info(f"DEBUG: Using {num_debug_files} training file(s) (~1%)")
+
     logger.info(f"Training files: {len(train_files)}")
     logger.info(f"Validation file: {os.path.basename(val_files[0])}")
 
@@ -487,6 +538,11 @@ def main():
     val_ds = create_dataset(
         val_files, input_shape, batch_size=1, is_train=False
     )
+
+    # Debug mode: limit validation samples
+    if debug_mode:
+        val_ds = val_ds.take(1)  # Only 1 validation sample
+        logger.info("DEBUG: Using 1 validation sample")
 
     # ==========================================================================
     # Create Model
@@ -614,7 +670,10 @@ def main():
         logger=logger
     )
 
-    callbacks = [swi_callback, comp_metric_callback]
+    # Epoch logging callback
+    epoch_logging_callback = EpochLoggingCallback(logger=logger)
+
+    callbacks = [epoch_logging_callback, swi_callback, comp_metric_callback]
 
     # ==========================================================================
     # Train
@@ -630,11 +689,17 @@ def main():
     # ==========================================================================
     # Final Evaluation with Best Model
     # ==========================================================================
-    logger.info("\nRunning final evaluation with best model...")
     best_weights_path = os.path.join(exp_dir, "model.weights.h5")
-    if os.path.exists(best_weights_path):
-        model.load_weights(best_weights_path)
-        final_results = comp_metric_callback.evaluate_competition_metrics(epoch='final')
+
+    # Save model if not saved yet (e.g., epochs < val_interval)
+    if not os.path.exists(best_weights_path):
+        logger.info("No model saved during training. Saving current model...")
+        model.save_weights(best_weights_path)
+
+    # Run final competition metric evaluation
+    logger.info("\nRunning final evaluation with best model...")
+    model.load_weights(best_weights_path)
+    final_results = comp_metric_callback.evaluate_competition_metrics(epoch='final')
 
     # ==========================================================================
     # Summary
@@ -647,12 +712,40 @@ def main():
     logger.info(f"Model saved to: {best_weights_path}")
     logger.info(f"Log saved to: {os.path.join(exp_dir, f'{exp_name}.log')}")
 
-    # Save history
+    # Save comprehensive history
     import json
     history_path = os.path.join(exp_dir, 'history.json')
+
+    # Combine all history data
+    comprehensive_history = {
+        # Per-epoch training metrics (loss, dice)
+        'training': {
+            k: [float(v) for v in vals]
+            for k, vals in history.history.items()
+        },
+        # Per-epoch detailed logs
+        'epochs': epoch_logging_callback.epoch_history,
+        # Competition metrics (eval_interval epochs + final)
+        'competition_metrics': comp_metric_callback.results_history,
+        # Best scores
+        'best': {
+            'competition_score': comp_metric_callback.best_score,
+        },
+        # Config summary
+        'config': {
+            'experiment_name': exp_name,
+            'model': model_arch,
+            'encoder': encoder,
+            'input_size': input_size,
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'learning_rate': lr,
+            'debug_mode': debug_mode,
+        }
+    }
+
     with open(history_path, 'w') as f:
-        history_dict = {k: [float(v) for v in vals] for k, vals in history.history.items()}
-        json.dump(history_dict, f, indent=2)
+        json.dump(comprehensive_history, f, indent=2)
     logger.info(f"History saved to: {history_path}")
 
 

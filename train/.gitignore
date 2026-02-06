@@ -1,0 +1,12 @@
+# Experiment outputs (runtime generated)
+experiments/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editor
+.vscode/
+*.swp

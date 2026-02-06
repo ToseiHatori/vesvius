@@ -1,9 +1,9 @@
-# Experiment 001: Baseline TransUNet
-# Based on train-vesuvius-surface-3d-detection-on-tpu_v3.ipynb
+# Experiment 002: TransUNet with clDice iters=50
+# Compare with exp001 (iters=10)
 
 experiment:
-  name: exp001_baseline
-  description: "Baseline TransUNet with SEResNeXt50 encoder"
+  name: exp002_cldice50
+  description: "TransUNet with clDice iters=50 (vs baseline iters=10)"
 
 model:
   architecture: transunet      # transunet or segformer
@@ -22,7 +22,7 @@ data:
   num_classes: 3               # 0: background, 1: surface, 2: ignore
 
 loss:
-  cldice_iters: 10             # centerline dice iterations
+  cldice_iters: 50             # centerline dice iterations (vs 10 in exp001)
   cldice_weight: 0.2           # loss = DiceCE + cldice_weight * clDice
 
 evaluation:

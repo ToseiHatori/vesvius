@@ -40,4 +40,4 @@ kaggle datasets version -p <ディレクトリパス> -m "更新メッセージ"
 ## 注意事項
 
 - `model.weights.h5` はバイナリファイルのため読み込まないこと
-- Kaggleデータセットはデフォルトでprivateとして作成される。公開する場合はKaggle上で設定を変更する
+- ファイルの削除は権限の問題があるのでdocker経由で行ってください

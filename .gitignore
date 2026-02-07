@@ -1,1 +1,15 @@
+# Model weights
 *.h5
+
+# Large data directories
+data/
+nnunet_output/
+nnunet_work/
+kaggle-upload/
+
+# Log files
+*.log
+
+# Temporary files
+__pycache__/
+.ipynb_checkpoints/

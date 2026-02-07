@@ -1,0 +1,21 @@
+{
+  "id": "toseihatori/surface-nnunet-preprocessing-3d-fullres",
+  "title": "Surface: nnUNet Preprocessing (3d_fullres)",
+  "code_file": "surface-nnunet-preprocessing.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": [],
+  "dataset_sources": [
+    "jirkaborovec/surface-packages-offline"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [
+    "vesuvius-challenge-surface-detection"
+  ],
+  "model_sources": [],
+  "docker_image": "gcr.io/kaggle-private-byod/python@sha256:7a9d2a6b13b3566aa6cc5a22447f3b3f99acf55dce44408deb90584b6d4b0dde"
+}

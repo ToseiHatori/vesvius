@@ -1,0 +1,284 @@
+## [Host Baseline] -- modified nnUNet 0.543 LB raw, 0.562 w/ post processing
+
+**投稿者**: Giorgio Angelotti (Competition Host) · 2026年1月7日
+
+---
+
+We are already talked about our baseline in some comments across the Discussions. I imagine that at this point of the competition it would be better to condensate the knowledge in a pinned post.
+
+In the past days we had anticipated that our baseline reached 0.59 LB, but actually the metrics script used was different than the one that's running on Kaggle, which is doing a chunked computation for resource optimization.
+
+**Our Kaggle sandbox submission with our baseline reaches 0.543 LB (Public LB)**
+
+**With some prediction post processing the score gets up to 0.562 LB (Public LB)**
+
+Our baseline is greatly based on three works by the MIC-DKFZ (https://www.dkfz.de/en/medical-image-computing) lab, which at some point also independently submitted a solution on the old version of the dataset in this competition (@fabianisensee).
+
+These three works are nnUNetv2 (https://arxiv.org/pdf/2404.09556), the SkeletonRecall Loss (https://arxiv.org/pdf/2404.03010) and batchgeneratorsv2 (https://github.com/MIC-DKFZ/batchgeneratorsv2).
+
+The architecture of the baseline is a nnUNetv2, trained with this `3d_fullres` plan:
+
+```json
+"3d_fullres": {
+    "data_identifier": "nnUNetPlans_3d_fullres",
+    "preprocessor_name": "DefaultPreprocessor",
+    "batch_size": 2,
+    "patch_size": [192, 192, 192],
+    "spacing": [1.0, 1.0, 1.0],
+    "normalization_schemes": ["ZScoreNormalization"],
+    "use_mask_for_norm": [false],
+    "resampling_fn_data": "resample_data_or_seg_to_shape",
+    "resampling_fn_seg": "resample_data_or_seg_to_shape",
+    "resampling_fn_data_kwargs": {
+        "is_seg": false,
+        "order": 3,
+        "order_z": 0,
+        "force_separate_z": null
+    },
+    "resampling_fn_seg_kwargs": {
+        "is_seg": true,
+        "order": 1,
+        "order_z": 0,
+        "force_separate_z": null
+    },
+    "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+    "resampling_fn_probabilities_kwargs": {
+        "is_seg": false,
+        "order": 1,
+        "order_z": 0,
+        "force_separate_z": null
+    },
+    "architecture": {
+        "network_class_name": "dynamic_network_architectures.architectures.unet.ResidualEncoderUNet",
+        "arch_kwargs": {
+            "n_stages": 6,
+            "features_per_stage": [32, 64, 128, 256, 320, 320],
+            "conv_op": "torch.nn.modules.conv.Conv3d",
+            "kernel_sizes": [[3,3,3], [3,3,3], [3,3,3], [3,3,3], [3,3,3], [3,3,3]],
+            "strides": [[1,1,1], [2,2,2], [2,2,2], [2,2,2], [2,2,2], [2,2,2]],
+            "n_blocks_per_stage": [1, 3, 4, 6, 6, 6],
+            "n_conv_per_stage_decoder": [1, 1, 1, 1, 1],
+            "conv_bias": true,
+            "norm_op": "torch.nn.modules.instancenorm.InstanceNorm3d",
+            "norm_op_kwargs": {"eps": 1e-05, "affine": true},
+            "dropout_op": null,
+            "dropout_op_kwargs": null,
+            "nonlin": "torch.nn.LeakyReLU",
+            "nonlin_kwargs": {"inplace": true}
+        },
+        "_kw_requires_import": ["conv_op", "norm_op", "dropout_op", "nonlin"]
+    },
+    "batch_dice": false
+}
+```
+
+As a custom trainer/loss, we used the `MedialSurfaceRecall` trainer defined in this repository (https://github.com/ScrollPrize/villa/blob/main/segmentation/models/arch/nnunet/nnunetv2/training/nnUNetTrainer/variants/loss/nnUNetTrainerSkeletonRecall.py), which is a modified version of the `SkeletonRecall trainer`. Our version, instead of computing a 3D tree-like skeleton, tries to approximate (with some impurities) the medial surface of the labels by just aggregating per-slice 2D skeletonizations across the 3 different axes. This loss helps fighting the creation of holes in the predictions, making the output look more sheet-like, at the expenses of having some more mergers, especially in more "packed" regions.
+
+During training, some custom augmentation were introduced in this edited version (https://github.com/ScrollPrize/villa/tree/main/segmentation/models/batchgeneratorsv2) of `batchgeneratorsv2`.
+
+The model was trained for about `1200 epochs` with a starting learning rate of 0.01.
+
+As an additional post-processing step, which boosted the Public LB from 0.543 LB to 0.562 LB, we thresholded the softmax output at `0.75`, and run on it a modified Frangi filter that enhances **surfaceness** rather than **vesselness** (it's basically the same, but with a different handling of the eigenvalues in the formula).
+
+We know that many of you already developed some solutions which fare better than this, and we hope that our knowledge can help you develop even more performing solutions (we didn't want to share it at the beginning of the challenge to avoid constraining your creativity on a particular road, rather than have you trying more exotic solutions 😃 . I am very curious to see the results of what @hengck23 and @tom99763 are doing to be honest ahah 👀)
+
+For more details, @seanjohnsonsp (who took care of the development of the baseline), will be happy to answer your questions!
+
+**Reactions**: kaggle (3), surprise (3)
+
+---
+
+## 32 Comments
+
+---
+
+### Manish Swami · 12 days ago · 462nd in this Competition [+1]
+
+Is anyone else using GroupNorm for their 3D U-Nets?
+
+I'm training a ResEncUNet with scSE attention on 192x192x192 patches. Since the batch size is small (4), GroupNorm felt like the right choice theoretically, and I'm getting decent convergence (Val Dice ~0.46).
+
+Just wondering if the top teams are sticking to standard InstanceNorm or if GroupNorm is the secret sauce for these thin structures?
+
+> #### Duong Nguyen · 12 days ago · 29th in this Competition [+1]
+>
+> my solution is based on nnUNet ResEncUNet with default instance norm, patch size 128, batch size 2. But why do you think group norm is appropriate for this task
+>
+> > #### Manish Swami · 12 days ago · 462nd in this Competition [0]
+> >
+> > IN is definitely a strong baseline (and batch size isn't really the issue since IN also doesn't depend on batch stats). My thought with GN is more about behavior: IN normalizes each channel independently and can sometimes wash out subtle intensity cues, which might matter for these thin layers. GN keeps some cross-channel structure, so it might give cleaner boundaries
+> >
+> > **Reactions**: love (1)
+
+---
+
+### Dieter · a month ago · 10th in this Competition [+24]
+
+I find this post highly demotivating. Whats the point in having worked on this problem, when you (as host) share a recipe in the last third of the competition which achieves a Top10 LB. You are constraining creativity so much with this.
+
+**Reactions**: thankYou (7), love (7), kaggle (2), funny (4), surprise (1)
+
+> #### Giorgio Angelotti (Competition Host) · a month ago [+2]
+>
+> Thanks for the feedback. I understand how a strong baseline shared mid‑competition can feel discouraging after you've invested a lot of effort.
+>
+> A couple clarifications: this isn't meant as a "winning recipe," it's a reference point. It scores 0.543 / 0.562 on the public LB, and several teams (including yours) are already ahead of it; it may also rank very differently on the private evaluation.
+>
+> We intentionally didn't pin a baseline at the start because we didn't want everyone to default to nnU‑Net immediately. I am confident that the top solutions will be much more creative than that! Our implementation has been public in our repo, but we're surfacing it now in one place for transparency and to give everyone a shared benchmark. Eventually, the goal (for us) is the strongest final solution, and a reproducible baseline helps people compare ideas and push beyond it, not replace the work already done or constrain creativity.
+>
+> > #### ForcewithMe · a month ago · 6th in this Competition [+1]
+> >
+> > Hi @giorgioangelotti, I really respect all of your effort for hosting this competition.
+> >
+> > However, I think it's about fairness. It would be much better if you post all of the great baseline/ideas at the early stages of the competition. The update of the dataset, along with all of the posts, makes the effort in the first 50 days meaningless.
+> >
+> > **Reactions**: thankYou (6)
+
+*(3 more replies collapsed)*
+
+---
+
+### Sergio Alvarez · a month ago · 3rd in this Competition [+8]
+
+Thanks for clarifying the 0.59 discrepancy, @giorgioangelotti and @seanjohnsonsp! Nice to see that teams are already above the baseline, it would be a bummer if no one were able to have higher scores than your baseline work.
+
+On the "creativity" discussion, I don't really agree that this is a problem. nnU-Net approaches are already widely known in competitions, have been shared in public notebooks, and even the MIC-DKFZ team is competing 🙌.
+
+Timing can feel frustrating, and maybe sharing it earlier would have helped to push further towards the main goal. Still, I appreciate for sharing!
+
+Happy Kaggling to all
+
+**Reactions**: love (1)
+
+---
+
+### GG Ayo (AyoGG) · a month ago · 11th in this Competition [+7]
+
+We ran training using the fully preset nnUNetv2 model with a patch size of 128 and performed post-processing, achieving a score of 0.562. VRAM usage was approximately 9GB, and training took about 40,000 seconds on a 5090 GPU.
+
+**Reactions**: kaggle (2)
+
+> #### Simon Alerdic · a month ago [0]
+>
+> Without nnunet, any luck with own custom pipeline? I was trying this (https://www.kaggle.com/code/jirkaborovec/surface-train-inference-3d-segm-gpu-augment), but the local score seems not that good.
+
+> #### ArjunB · a month ago · 39th in this Competition [+1]
+>
+> what about the loss fn?
+
+---
+
+### yukiZ · a month ago · 257th in this Competition [+3]
+
+FYI. I won **LB.543 with TransUNet** (I won't go into details as the competition is nearing the end, about a month in).
+
+A quick internet survey also showed some papers showing that **TransUNet** is superior to **nnUNet**. Therefore, I don't think it's clear which architecture will ultimately win.
+
+![TransUNet comparison image](https://www.googleapis.com/download/storage/v1/b/kaggle-forum-message-attachments/o/inbox%2F3802145%2Fb1e7c7abf2cc26f66677c94416110f25%2F2026-01-08%20000050.png)
+
+Reference: https://arxiv.org/pdf/2310.07781
+
+> #### Manas Choudhary · a month ago · 21st in this Competition [+1]
+>
+> Maybe if we try and use strides, convs, and all other possible minor components specially designed for this problem, like nnUNet does in TranUNet, we might get better results.
+>
+> **Reactions**: love (1), kaggle (1)
+>
+> > #### Giorgio Angelotti (Competition Host) · a month ago [+1]
+> >
+> > One thing I always imagined could help, but I never tried, are deformable convolutions (https://arxiv.org/pdf/1703.06211)
+> >
+> > **Reactions**: love (1), kaggle (1)
+> >
+> > > #### sroger · a month ago · 906th in this Competition [+1]
+> > >
+> > > I was looking at deformable attention but could not find any existing 3D cuda ops.
+> > > I imagine a SOTA model would be a ResUnet or TransUnet encoder + Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
+> > >
+> > > **Reactions**: love (1), kaggle (1)
+> >
+> > > #### Innat · 12 days ago · 61st in this Competition [+1]
+> > >
+> > > @giorgioangelotti
+> > >
+> > > About deform-conv, here is one candidate model, deform-uxnet (https://github.com/MASILab/deform-uxnet). (Though, citation is low.)
+
+*(3 more replies collapsed)*
+
+---
+
+### GG Ayo (AyoGG) · a month ago · 11th in this Competition [+4]
+
+If you have an H200, can I connect via SSH?
+
+**Reactions**: funny (4)
+
+---
+
+### tingyi · a month ago · 11th in this Competition [+4]
+
+Fun fact: the results we got with the vanilla nnU-Net v2 were also 0.562.
+
+> #### tingyi · a month ago · 11th in this Competition [0]
+>
+> Rigorous comparative experiments are paramount.
+
+*(3 more replies collapsed)*
+
+---
+
+### dragon zhang · a month ago · 604th in this Competition [+1]
+
+Did you train with Kaggle? because if I try bigger size, OOM.
+
+> #### Manas Choudhary · a month ago · 21st in this Competition [0]
+>
+> nnUNet automatically changes sizes according to gpu, on kaggle it becomes 128
+>
+> > #### dragon zhang · a month ago · 604th in this Competition [0]
+> >
+> > I wonder if big size brings better performance?
+>
+> > #### Manas Choudhary · a month ago · 21st in this Competition [+2]
+> >
+> > It does, but not worth trying hard to train larger resolutions at this point, I think a good strategy is to train smaller res models for testing at this stage, and then for final model train as large model as possible.
+
+---
+
+### yuanzhe zhou · a month ago · 269th in this Competition [-8]
+
+Does the host plan to release the baseline [train + infer] code (although I really learned a lot from this discussion)?
+
+> #### Manas Choudhary · a month ago · 21st in this Competition [+1]
+>
+> There is a public notebook by @jirkaborovec which has nnUNet implementation for training and inference.
+>
+> (https://www.kaggle.com/code/jirkaborovec/surface-nnunet-training-inference-with-2xt4)
+
+---
+
+### Andre Filipe Ferreira · 16 days ago · 696th in this Competition [0]
+
+Thanks for sharing. Could you please share the individual results (mean for each metric)? I'm curious regarding the TopoScore. I am not able to improve it further than 0.10, and I'm using a customized U-Net. I want to understand if those results are highly pushed by the SurfaceDice@τ, or if it is a balanced result. Perhaps your customized data augmentations and loss functions are pushing the results even further. Thanks!
+
+---
+
+### Navneet · 25 days ago [0]
+
+Is our baseline greatly based on three works by the MIC-DKFZ lab?
+
+---
+
+### [Deleted Comment]
+
+> #### GG Ayo (AyoGG) · a month ago · 11th in this Competition [+3]
+>
+> Post-processing should be the only area where differences can arise.
+
+> #### DECEM · a month ago · 17th in this Competition [0]
+>
+> Do what you want, not what they say.
+
+---
+
+### [Deleted Comment]

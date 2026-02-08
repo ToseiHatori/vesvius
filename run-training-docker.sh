@@ -99,7 +99,7 @@ docker run --rm \
     -e "nnUNet_preprocessed=/kaggle/working/nnUNet_preprocessed" \
     -e "nnUNet_results=/kaggle/working/nnUNet_results" \
     -e "nnUNet_USE_BLOSC2=1" \
-    -e "nnUNet_compile=true" \
+    -e "nnUNet_compile=false" \
     -w /workspace \
     ${KAGGLE_IMAGE} \
     bash -c "

@@ -88,7 +88,7 @@ DEBUG_BATCH_SIZE = 1
 HOST_BASELINE_PLAN_CONFIG = {
     "data_identifier": "nnUNetPlans_3d_fullres",
     "preprocessor_name": "DefaultPreprocessor",
-    "batch_size": 2,
+    "batch_size": 1,  # Reduced from 2 for single GPU (host used 2 with larger VRAM)
     "patch_size": [192, 192, 192],
     "spacing": [1.0, 1.0, 1.0],
     "normalization_schemes": ["ZScoreNormalization"],
@@ -930,12 +930,40 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
         # Host Baseline uses 0.01 initial learning rate
         self.initial_lr = 0.01
 
+        # Read epochs from environment variable (set by surface-nnunet-training-local.py)
+        import os
+        epochs_env = os.environ.get("NNUNET_EPOCHS")
+        if epochs_env is not None:
+            self.num_epochs = int(epochs_env)
+            print(f"Using {self.num_epochs} epochs from NNUNET_EPOCHS environment variable")
+
+        # Seed fixing for reproducibility
+        seed_env = os.environ.get("NNUNET_SEED")
+        if seed_env is not None:
+            seed = int(seed_env)
+            self._set_seed(seed)
+            print(f"Using seed {seed} from NNUNET_SEED environment variable")
+
+    def _set_seed(self, seed: int):
+        """Set random seed for reproducibility."""
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            # For full determinism (may impact performance)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        print(f"Random seed set to {seed} for reproducibility")
+
     def _build_loss(self):
         """
-        Build the combined Dice + CE + Skeleton Recall loss function.
+        Build the combined Dice + CE + Skeleton Recall loss function with Deep Supervision.
 
         Returns:
-            Loss function (without deep supervision wrapper - handled in train_step)
+            Loss function wrapped with DeepSupervisionWrapperWithSkeleton if deep supervision is enabled
         """
         # Get ignore label if set
         ignore_label = self.label_manager.ignore_label if hasattr(self.label_manager, 'ignore_label') else None
@@ -971,8 +999,18 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
             dice_class=MemoryEfficientSoftDiceLoss
         )
 
-        # Note: We don't use deep supervision wrapper because skeleton needs
-        # special handling. train_step uses only full-resolution output.
+        # Wrap with Deep Supervision if enabled (per villa implementation)
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            # Exponential decay weights: [1, 0.5, 0.25, 0.125, ...]
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            # Set last weight to 0 (per villa)
+            if len(weights) > 1:
+                weights[-1] = 0
+            # Normalize weights to sum to 1
+            weights = weights / weights.sum()
+            self.ds_loss_weights = weights.tolist()
+            loss = DeepSupervisionWrapperWithSkeleton(loss, self.ds_loss_weights)
 
         return loss
 
@@ -983,10 +1021,13 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
 
     def train_step(self, batch: dict) -> dict:
         """
-        Perform a single training step with skeleton recall loss.
+        Perform a single training step with skeleton recall loss and deep supervision.
 
         Computes skeleton from target segmentation on CPU, then transfers to GPU.
         Uses do_tube=False for training per villa implementation.
+
+        With deep supervision enabled, loss is computed at all scales with exponential
+        decay weights (per villa implementation).
         """
         data = batch['data']
         target = batch['target']
@@ -1002,25 +1043,28 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else torch.autocast('cpu', enabled=False):
             output = self.network(data)
 
-            # For skeleton loss, use only final (full resolution) output and target
-            # This avoids complex deep supervision alignment issues
-            if isinstance(output, (list, tuple)):
-                output_for_loss = output[0]  # Final full resolution output
-            else:
-                output_for_loss = output
-
+            # Get full resolution target for skeleton computation
             if isinstance(target, list):
-                target_for_loss = target[0]  # Final full resolution target
+                target_fullres = target[0]
             else:
-                target_for_loss = target
+                target_fullres = target
 
-            # Compute skeleton from target (do_tube=False for training per villa)
-            target_np = target_for_loss.detach().cpu().numpy()
+            # Compute skeleton from full resolution target (do_tube=False for training per villa)
+            target_np = target_fullres.detach().cpu().numpy()
             skeleton_np = compute_skeleton_batch(target_np, do_tube=False)
-            gt_skeleton = torch.from_numpy(skeleton_np).to(self.device, non_blocking=True)
+            gt_skeleton = torch.from_numpy(skeleton_np).float().to(self.device, non_blocking=True)
 
-            # Compute loss with skeleton (only final output)
-            l = self.loss(output_for_loss, target_for_loss, gt_skeleton)
+            # Compute loss with deep supervision if enabled
+            if self.enable_deep_supervision and isinstance(output, (list, tuple)):
+                # Pass outputs, targets, and skeleton to DeepSupervisionWrapperWithSkeleton
+                l = self.loss(output, target, gt_skeleton)
+            else:
+                # Single output mode (no deep supervision)
+                if isinstance(output, (list, tuple)):
+                    output = output[0]
+                if isinstance(target, list):
+                    target = target[0]
+                l = self.loss(output, target, gt_skeleton)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1037,10 +1081,13 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
 
     def validation_step(self, batch: dict) -> dict:
         """
-        Perform validation step with skeleton recall loss.
+        Perform validation step with skeleton recall loss and deep supervision.
 
         Uses do_tube=True for validation per villa implementation.
         Returns tp_hard, fp_hard, fn_hard for online Dice evaluation.
+
+        With deep supervision enabled, loss is computed at all scales.
+        Dice metrics are computed only at full resolution.
         """
         from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 
@@ -1057,54 +1104,61 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
             with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else torch.autocast('cpu', enabled=False):
                 output = self.network(data)
 
-                # For skeleton loss, use only final (full resolution) output and target
+                # Get full resolution output and target for metrics
                 if isinstance(output, (list, tuple)):
-                    output_for_loss = output[0]
+                    output_fullres = output[0]
                 else:
-                    output_for_loss = output
+                    output_fullres = output
 
                 if isinstance(target, list):
-                    target_for_loss = target[0]
+                    target_fullres = target[0]
                 else:
-                    target_for_loss = target
+                    target_fullres = target
 
-                # Compute skeleton (do_tube=True for validation per villa)
-                target_np = target_for_loss.detach().cpu().numpy()
+                # Compute skeleton from full resolution target (do_tube=True for validation per villa)
+                target_np = target_fullres.detach().cpu().numpy()
                 skeleton_np = compute_skeleton_batch(target_np, do_tube=True)
-                gt_skeleton = torch.from_numpy(skeleton_np).to(self.device, non_blocking=True)
+                gt_skeleton = torch.from_numpy(skeleton_np).float().to(self.device, non_blocking=True)
 
-                # Compute loss (only final output)
-                l = self.loss(output_for_loss, target_for_loss, gt_skeleton)
+                # Compute loss with deep supervision if enabled
+                if self.enable_deep_supervision and isinstance(output, (list, tuple)):
+                    # Pass outputs, targets, and skeleton to DeepSupervisionWrapperWithSkeleton
+                    l = self.loss(output, target, gt_skeleton)
+                else:
+                    # Single output mode (no deep supervision)
+                    l = self.loss(output_fullres, target_fullres, gt_skeleton)
 
-                # Compute tp/fp/fn for online Dice evaluation
+                # Compute tp/fp/fn for online Dice evaluation (full resolution only)
                 # axes excludes batch (0) and channel (1) dimensions
-                axes = [0] + list(range(2, output_for_loss.ndim))
+                axes = [0] + list(range(2, output_fullres.ndim))
 
                 # Region-based prediction using sigmoid threshold
                 if self.label_manager.has_regions:
-                    predicted_segmentation_onehot = (torch.sigmoid(output_for_loss) > 0.5).long()
+                    predicted_segmentation_onehot = (torch.sigmoid(output_fullres) > 0.5).long()
                 else:
                     # Standard softmax-based segmentation
-                    output_seg = output_for_loss.argmax(1)[:, None]
-                    predicted_segmentation_onehot = torch.zeros(output_for_loss.shape, device=output_for_loss.device, dtype=torch.float16)
+                    output_seg = output_fullres.argmax(1)[:, None]
+                    predicted_segmentation_onehot = torch.zeros(output_fullres.shape, device=output_fullres.device, dtype=torch.float16)
                     predicted_segmentation_onehot.scatter_(1, output_seg, 1)
                     del output_seg
 
                 # Handle ignore label if present
+                target_for_metrics = target_fullres
                 if self.label_manager.has_ignore_label:
                     if not self.label_manager.has_regions:
-                        mask = (target_for_loss != self.label_manager.ignore_label).float()
-                        target_for_loss[target_for_loss == self.label_manager.ignore_label] = 0
+                        mask = (target_for_metrics != self.label_manager.ignore_label).float()
+                        target_for_metrics = target_for_metrics.clone()
+                        target_for_metrics[target_for_metrics == self.label_manager.ignore_label] = 0
                     else:
-                        if target_for_loss.dtype == torch.bool:
-                            mask = ~target_for_loss[:, -1:]
+                        if target_for_metrics.dtype == torch.bool:
+                            mask = ~target_for_metrics[:, -1:]
                         else:
-                            mask = 1 - target_for_loss[:, -1:]
-                        target_for_loss = target_for_loss[:, :-1]
+                            mask = 1 - target_for_metrics[:, -1:]
+                        target_for_metrics = target_for_metrics[:, :-1]
                 else:
                     mask = None
 
-                tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target_for_loss, axes=axes, mask=mask)
+                tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target_for_metrics, axes=axes, mask=mask)
 
                 tp_hard = tp.detach().cpu().numpy()
                 fp_hard = fp.detach().cpu().numpy()
@@ -1237,10 +1291,19 @@ def run_training(
     pretrained_weights: Optional[Path] = None,
     continue_training: bool = False,
     num_gpus: int = 1,
-    timeout: Optional[int] = None
+    timeout: Optional[int] = None,
+    seed: Optional[int] = None
 ) -> bool:
     """Run nnUNet training."""
     trainer_name = get_trainer_name(epochs, trainer)
+
+    # Set epochs via environment variable for custom trainers
+    epochs_to_use = epochs if epochs else 1000
+    os.environ["NNUNET_EPOCHS"] = str(epochs_to_use)
+
+    # Set seed via environment variable for reproducibility (default: 42)
+    seed_to_use = seed if seed is not None else 42
+    os.environ["NNUNET_SEED"] = str(seed_to_use)
 
     cmd = f"nnUNetv2_train {dataset_id:03d} {config} {fold} -p {plans} -tr {trainer_name}"
 
@@ -1251,8 +1314,7 @@ def run_training(
     if num_gpus > 1:
         cmd += f" -num_gpus {num_gpus}"
 
-    epochs_str = epochs if epochs else 1000
-    return run_command(cmd, f"Training ({epochs_str} epochs, {num_gpus} GPUs)", timeout=timeout)
+    return run_command(cmd, f"Training ({epochs_to_use} epochs, {num_gpus} GPUs)", timeout=timeout)
 
 
 def run_inference(
@@ -1918,6 +1980,7 @@ def full_pipeline(
     apply_frangi: bool = True,
     timeout: Optional[int] = None,
     max_cases: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> bool:
     """
     Run complete training/inference pipeline.
@@ -2002,7 +2065,8 @@ def full_pipeline(
             trainer=trainer,
             continue_training=continue_training,
             num_gpus=num_gpus,
-            timeout=timeout
+            timeout=timeout,
+            seed=seed
         )
         if not success:
             print("Training failed!")
@@ -2236,6 +2300,8 @@ Host Baseline:
                         help="Fold number (0-4) or 'all' (default: all)")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Number of epochs (1,5,10,20,50,100,250,500,750,1000)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility")
     parser.add_argument("--gpus", type=int, default=None,
                         help="Number of GPUs (default: auto-detect)")
     parser.add_argument("--continue-training", action="store_true",
@@ -2302,6 +2368,7 @@ Host Baseline:
             continue_training=args.continue_training,
             timeout=args.timeout,
             max_cases=args.max_cases,
+            seed=args.seed,
         )
         sys.exit(0 if success else 1)
 
@@ -2332,6 +2399,7 @@ Host Baseline:
         apply_frangi=not args.no_frangi,
         timeout=args.timeout,
         max_cases=args.max_cases,
+        seed=args.seed,
     )
 
     sys.exit(0 if success else 1)

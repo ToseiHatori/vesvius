@@ -14,6 +14,9 @@ Usage:
     # Host Baseline (recommended)
     python surface-nnunet-training-local.py --host-baseline --epochs 1000
 
+    # Debug mode (fast verification with small data)
+    python surface-nnunet-training-local.py --debug --train
+
     # Training only
     python surface-nnunet-training-local.py --train --epochs 50
 
@@ -72,6 +75,13 @@ HOST_BASELINE_TRAINER = "nnUNetTrainerMedialSurfaceRecall"
 HOST_BASELINE_EPOCHS = 1200  # Host used ~1200 epochs
 HOST_BASELINE_THRESHOLD = 0.75
 HOST_BASELINE_LR = 0.01
+
+# Debug mode defaults
+DEBUG_EPOCHS = 1
+DEBUG_MAX_CASES = 1
+DEBUG_NUM_VAL_BATCHES = 1  # Reduce validation batches
+DEBUG_PATCH_SIZE = [64, 64, 64]  # Smaller patch size for OOM prevention
+DEBUG_BATCH_SIZE = 1
 
 # Host Baseline 3d_fullres plan configuration (from host_solution.txt)
 # This is the exact configuration used by the competition host
@@ -163,12 +173,15 @@ def setup_environment():
     os.environ["nnUNet_raw"] = str(NNUNET_RAW)
     os.environ["nnUNet_preprocessed"] = str(NNUNET_PREPROCESSED)
     os.environ["nnUNet_results"] = str(NNUNET_RESULTS)
-    os.environ["nnUNet_compile"] = "true"
+    # Only set nnUNet_compile if not already set (e.g., by debug mode)
+    if "nnUNet_compile" not in os.environ:
+        os.environ["nnUNet_compile"] = "true"
     os.environ["nnUNet_USE_BLOSC2"] = "1"
 
     print(f"nnUNet_raw: {NNUNET_RAW}")
     print(f"nnUNet_preprocessed: {NNUNET_PREPROCESSED}")
     print(f"nnUNet_results: {NNUNET_RESULTS}")
+    print(f"nnUNet_compile: {os.environ.get('nnUNet_compile')}")
     print(f"NUM_WORKERS: {get_num_workers()}")
     print(f"NUM_GPUS: {get_gpu_count()}")
 
@@ -268,185 +281,133 @@ def install_custom_trainer() -> Path:
     skeleton_recall_code = '''"""
 Soft Skeleton Recall Loss for topology-preserving segmentation.
 
-Based on the clDice paper and official implementations.
-Computes skeleton recall by comparing predicted skeleton with ground truth skeleton.
+Based on MIC-DKFZ/Skeleton-Recall implementation.
+The skeleton is pre-computed and passed directly to the loss function.
+
+Key difference from clDice: skeleton is NOT computed inside the loss function.
+Instead, it's computed upstream (in data augmentation or training step) and
+passed as the target (y) argument.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Callable
 
-
-def soft_erode(img: torch.Tensor) -> torch.Tensor:
-    """Soft morphological erosion using min pooling."""
-    if len(img.shape) == 4:
-        # 2D: (B, C, H, W)
-        p1 = -F.max_pool2d(-img, kernel_size=(3, 1), stride=(1, 1), padding=(1, 0))
-        p2 = -F.max_pool2d(-img, kernel_size=(1, 3), stride=(1, 1), padding=(0, 1))
-        return torch.min(p1, p2)
-    elif len(img.shape) == 5:
-        # 3D: (B, C, D, H, W)
-        p1 = -F.max_pool3d(-img, kernel_size=(3, 1, 1), stride=(1, 1, 1), padding=(1, 0, 0))
-        p2 = -F.max_pool3d(-img, kernel_size=(1, 3, 1), stride=(1, 1, 1), padding=(0, 1, 0))
-        p3 = -F.max_pool3d(-img, kernel_size=(1, 1, 3), stride=(1, 1, 1), padding=(0, 0, 1))
-        return torch.min(torch.min(p1, p2), p3)
-    else:
-        raise ValueError(f"Expected 4D or 5D input, got {len(img.shape)}D")
-
-
-def soft_dilate(img: torch.Tensor) -> torch.Tensor:
-    """Soft morphological dilation using max pooling."""
-    if len(img.shape) == 4:
-        # 2D
-        return F.max_pool2d(img, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-    elif len(img.shape) == 5:
-        # 3D
-        return F.max_pool3d(img, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1))
-    else:
-        raise ValueError(f"Expected 4D or 5D input, got {len(img.shape)}D")
-
-
-def soft_open(img: torch.Tensor) -> torch.Tensor:
-    """Soft morphological opening (erosion followed by dilation)."""
-    return soft_dilate(soft_erode(img))
-
-
-def soft_skel(img: torch.Tensor, num_iter: int = 10) -> torch.Tensor:
-    """
-    Compute soft skeleton using iterative morphological operations.
-
-    This approximates skeletonization by iteratively eroding the image
-    and subtracting the opening at each scale.
-
-    Args:
-        img: Input tensor (B, C, ...) with values in [0, 1]
-        num_iter: Number of iterations (skeleton thickness)
-
-    Returns:
-        Soft skeleton tensor
-    """
-    img_eroded = img.clone()
-    skel = F.relu(img - soft_open(img))
-
-    for _ in range(num_iter):
-        img_eroded = soft_erode(img_eroded)
-        delta = F.relu(img_eroded - soft_open(img_eroded))
-        skel = skel + F.relu(delta - skel * delta)
-
-    return skel
+try:
+    from nnunetv2.utilities.ddp_allgather import AllGatherGrad
+except ImportError:
+    AllGatherGrad = None
 
 
 class SoftSkeletonRecallLoss(nn.Module):
     """
-    Soft Skeleton Recall Loss.
+    Soft Skeleton Recall Loss (MIC-DKFZ implementation).
 
-    Computes the recall of the ground truth skeleton in the predicted segmentation.
-    This encourages the model to preserve topological structures (thin connections).
+    Computes recall of ground truth skeleton in predicted segmentation:
+    recall = sum(pred * skel_gt) / sum(skel_gt)
 
-    Loss = 1 - (sum(pred * gt_skel) + smooth) / (sum(gt_skel) + smooth)
+    IMPORTANT: The skeleton (y) must be pre-computed and passed directly.
+    This loss does NOT compute skeleton internally.
 
     Args:
-        smooth: Smoothing factor to avoid division by zero
-        num_iter: Number of iterations for soft skeletonization
-        do_bg: Whether to include background class (default False)
-        apply_nonlin: Optional nonlinearity to apply to predictions (e.g., softmax)
+        apply_nonlin: Nonlinearity to apply to predictions (e.g., softmax)
+        batch_dice: Whether to compute batch-level recall (sum across batch)
+        do_bg: Whether to include background class (must be False)
+        smooth: Smoothing factor
+        ddp: Whether using distributed training
     """
 
     def __init__(
         self,
-        smooth: float = 1.0,
-        num_iter: int = 10,
+        apply_nonlin: Callable = None,
+        batch_dice: bool = False,
         do_bg: bool = False,
-        apply_nonlin: Callable = None
+        smooth: float = 1.0,
+        ddp: bool = True
     ):
         super().__init__()
-        self.smooth = smooth
-        self.num_iter = num_iter
-        self.do_bg = do_bg
+        if do_bg:
+            raise RuntimeError("skeleton recall does not work with background")
+        self.batch_dice = batch_dice
         self.apply_nonlin = apply_nonlin
+        self.smooth = smooth
+        self.ddp = ddp
 
     def forward(
         self,
-        net_output: torch.Tensor,
-        gt: torch.Tensor,
-        gt_skeleton: torch.Tensor = None,
+        x: torch.Tensor,
+        y: torch.Tensor,
         loss_mask: torch.Tensor = None
     ) -> torch.Tensor:
         """
         Compute skeleton recall loss.
 
-        Following nnUNet SoftDiceLoss pattern:
-        - gt can be label map (B, 1, ...) or one-hot (B, C, ...)
-        - one-hot conversion is done internally
-        - gt_skeleton can be pre-computed for efficiency
-
         Args:
-            net_output: Network predictions (B, C, ...)
-            gt: Ground truth labels (B, 1, ...) or one-hot (B, C, ...)
-            gt_skeleton: Pre-computed skeleton (optional, for efficiency)
-            loss_mask: Mask for valid regions (B, 1, ...) [optional]
+            x: Network predictions (B, C, D, H, W)
+            y: Pre-computed skeleton target (B, 1, D, H, W) with class labels
+               OR one-hot skeleton (B, C, D, H, W)
+            loss_mask: Optional mask for valid regions
 
         Returns:
-            Skeleton recall loss (scalar)
+            Negative skeleton recall (for minimization)
         """
-        shp_x = net_output.shape
-        axes = tuple(range(2, len(shp_x)))
+        shp_x, shp_y = x.shape, y.shape
 
-        # Apply nonlinearity if specified
+        # Apply nonlinearity (softmax) to predictions
         if self.apply_nonlin is not None:
-            net_output = self.apply_nonlin(net_output)
+            x = self.apply_nonlin(x)
 
-        # Use pre-computed skeleton if provided, otherwise compute it
-        if gt_skeleton is not None:
-            # Ensure skeleton matches output shape
-            if gt_skeleton.shape != net_output.shape:
-                # Resize skeleton to match (for deep supervision scales)
-                gt_skeleton = F.interpolate(
-                    gt_skeleton.float(),
-                    size=net_output.shape[2:],
-                    mode='trilinear' if len(net_output.shape) == 5 else 'bilinear',
-                    align_corners=False
-                )
-                gt_skeleton = (gt_skeleton > 0.5).float()
+        # Remove background channel from predictions
+        x = x[:, 1:]
+
+        # Spatial axes for summation
+        axes = list(range(2, len(shp_x)))
+
+        with torch.no_grad():
+            # Handle shape mismatch
+            if len(shp_x) != len(shp_y):
+                y = y.view((shp_y[0], 1, *shp_y[1:]))
+
+            # Convert skeleton to one-hot if needed
+            if all([i == j for i, j in zip(x.shape, y.shape)]):
+                # Already matches prediction shape (minus background removed above)
+                # This shouldn't happen normally, but handle it
+                y_onehot = y
+            elif y.shape[1] == 1:
+                # Skeleton has class labels (B, 1, D, H, W) - convert to one-hot
+                gt = y.long()
+                y_onehot = torch.zeros(shp_x, device=x.device, dtype=y.dtype)
+                y_onehot.scatter_(1, gt, 1)
+                # Remove background channel
+                y_onehot = y_onehot[:, 1:]
+            else:
+                # Already one-hot with all channels
+                y_onehot = y[:, 1:]
+
+        # Compute skeleton recall
+        if loss_mask is None:
+            sum_gt = y_onehot.sum(axes)
+            inter_rec = (x * y_onehot).sum(axes)
         else:
-            # Convert gt to one-hot if needed (same pattern as get_tp_fp_fn_tn)
-            with torch.no_grad():
-                if net_output.ndim != gt.ndim:
-                    gt = gt.view((gt.shape[0], 1, *gt.shape[1:]))
+            sum_gt = (y_onehot * loss_mask).sum(axes)
+            inter_rec = (x * y_onehot * loss_mask).sum(axes)
 
-                if net_output.shape == gt.shape:
-                    # Already one-hot
-                    y_onehot = gt.to(torch.float32)
-                else:
-                    # Convert to one-hot
-                    y_onehot = torch.zeros(net_output.shape, device=net_output.device, dtype=torch.float32)
-                    y_onehot.scatter_(1, gt.long(), 1)
+        # Handle distributed training
+        if self.ddp and self.batch_dice and AllGatherGrad is not None:
+            inter_rec = AllGatherGrad.apply(inter_rec).sum(0)
+            sum_gt = AllGatherGrad.apply(sum_gt).sum(0)
 
-            # Compute soft skeleton of ground truth
-            gt_skeleton = soft_skel(y_onehot, self.num_iter)
+        # Batch-level recall
+        if self.batch_dice:
+            inter_rec = inter_rec.sum(0)
+            sum_gt = sum_gt.sum(0)
 
-        # Apply loss mask if provided
-        if loss_mask is not None:
-            mask_here = torch.tile(loss_mask, (1, net_output.shape[1], *[1 for _ in range(2, net_output.ndim)]))
-            net_output = net_output * mask_here
-            gt_skeleton = gt_skeleton * mask_here
+        # Compute recall: (intersection + smooth) / (skeleton_sum + smooth)
+        rec = (inter_rec + self.smooth) / (torch.clip(sum_gt + self.smooth, 1e-8))
+        rec = rec.mean()
 
-        # Compute intersection (recall numerator)
-        intersection = (net_output * gt_skeleton).sum(dim=axes)
-
-        # Compute skeleton sum (recall denominator)
-        gt_skel_sum = gt_skeleton.sum(dim=axes)
-
-        # Compute recall per class
-        recall = (intersection + self.smooth) / (gt_skel_sum.clamp(min=1e-8) + self.smooth)
-
-        # Skip background if specified
-        if not self.do_bg:
-            recall = recall[:, 1:]
-
-        # Return mean loss (1 - recall)
-        return 1.0 - recall.mean()
+        # Return negative recall for minimization
+        return -rec
 '''
 
     skeleton_recall_path = loss_dir / "skeleton_recall.py"
@@ -459,51 +420,54 @@ class SoftSkeletonRecallLoss(nn.Module):
     compound_losses_code = '''"""
 Compound loss combining Dice, Cross-Entropy, and Skeleton Recall.
 
-This loss is designed for topology-preserving segmentation, particularly
-useful for thin structures like papyrus surfaces.
+Based on MIC-DKFZ/Skeleton-Recall implementation.
+This loss is designed for topology-preserving segmentation.
 """
 
 import torch
 import torch.nn as nn
-from typing import Callable, List, Tuple
 
 from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss
 from nnunetv2.training.loss.skeleton_recall import SoftSkeletonRecallLoss
 
 
+def softmax_helper_dim1(x):
+    """Apply softmax along channel dimension."""
+    return torch.softmax(x, dim=1)
+
+
 class DC_SkelREC_and_CE_loss(nn.Module):
     """
     Combined Dice + Skeleton Recall + Cross-Entropy Loss.
 
+    Based on MIC-DKFZ implementation:
     Total loss = weight_dice * DiceLoss + weight_ce * CELoss + weight_srec * SkelRecLoss
 
-    This loss combines:
-    1. Dice Loss: For overall segmentation quality
-    2. Cross-Entropy Loss: For pixel-wise classification
-    3. Skeleton Recall Loss: For topology preservation
+    IMPORTANT: The skeleton (skel) must be pre-computed and passed to forward().
+    Skeleton is passed to SoftSkeletonRecallLoss as the target (y).
 
     Args:
         soft_dice_kwargs: Arguments for SoftDiceLoss
+        soft_skelrec_kwargs: Arguments for SoftSkeletonRecallLoss
         ce_kwargs: Arguments for RobustCrossEntropyLoss
-        skel_kwargs: Arguments for SoftSkeletonRecallLoss
         weight_ce: Weight for CE loss (default 1.0)
         weight_dice: Weight for Dice loss (default 1.0)
         weight_srec: Weight for Skeleton Recall loss (default 1.0)
         ignore_label: Label to ignore in loss computation
-        dice_class: Dice loss class to use (default SoftDiceLoss)
+        dice_class: Dice loss class to use
     """
 
     def __init__(
         self,
         soft_dice_kwargs: dict = None,
+        soft_skelrec_kwargs: dict = None,
         ce_kwargs: dict = None,
-        skel_kwargs: dict = None,
         weight_ce: float = 1.0,
         weight_dice: float = 1.0,
         weight_srec: float = 1.0,
         ignore_label: int = None,
-        dice_class: type = SoftDiceLoss
+        dice_class: type = MemoryEfficientSoftDiceLoss
     ):
         super().__init__()
 
@@ -513,85 +477,69 @@ class DC_SkelREC_and_CE_loss(nn.Module):
                 ce_kwargs = {}
             ce_kwargs['ignore_index'] = ignore_label
 
-        # Initialize component losses
         self.weight_dice = weight_dice
         self.weight_ce = weight_ce
         self.weight_srec = weight_srec
         self.ignore_label = ignore_label
 
         # Dice loss
-        # NOTE: do_bg=False (don't include background in Dice) per villa implementation
-        # apply_nonlin uses softmax_helper_dim1 as per MIC-DKFZ/nnUNet compound_losses.py
-        def softmax_helper_dim1(x):
-            return torch.softmax(x, dim=1)
-
         if soft_dice_kwargs is None:
             soft_dice_kwargs = {'batch_dice': False, 'do_bg': False, 'smooth': 1e-5, 'ddp': False}
-        self.dice = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
+        self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
 
-        # Cross-entropy loss (no softmax needed - CE applies it internally)
+        # Cross-entropy loss
         if ce_kwargs is None:
             ce_kwargs = {}
         self.ce = RobustCrossEntropyLoss(**ce_kwargs)
 
         # Skeleton recall loss
-        # apply_nonlin uses softmax_helper_dim1 as per MIC-DKFZ implementation
-        if skel_kwargs is None:
-            skel_kwargs = {'smooth': 1.0, 'num_iter': 10, 'do_bg': False}
-        self.skel_rec = SoftSkeletonRecallLoss(apply_nonlin=softmax_helper_dim1, **skel_kwargs)
+        if soft_skelrec_kwargs is None:
+            soft_skelrec_kwargs = {'batch_dice': False, 'do_bg': False, 'smooth': 1e-5, 'ddp': False}
+        self.srec = SoftSkeletonRecallLoss(apply_nonlin=softmax_helper_dim1, **soft_skelrec_kwargs)
 
     def forward(
         self,
         net_output: torch.Tensor,
         target: torch.Tensor,
-        gt_skeleton: torch.Tensor = None,
+        skel: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute combined loss.
 
-        Following nnUNet DC_and_CE_loss pattern:
-        - target must be (B, 1, ...) with class labels
-        - one-hot encoding is handled internally by each loss component
-
         Args:
-            net_output: Network predictions (B, C, ...)
-            target: Ground truth labels (B, 1, ...)
-            gt_skeleton: Pre-computed skeleton (optional, for efficiency)
+            net_output: Network predictions (B, C, D, H, W)
+            target: Ground truth labels (B, 1, D, H, W)
+            skel: Pre-computed skeleton (B, 1, D, H, W) with class labels
 
         Returns:
             Combined loss (scalar)
         """
-        # Handle ignore label (same pattern as DC_and_CE_loss)
+        # Handle ignore label
         if self.ignore_label is not None:
             assert target.shape[1] == 1, 'ignore label not implemented for one-hot targets'
             mask = target != self.ignore_label
-            # Replace ignore label with 0 (doesn't matter, gradients ignored)
             target_dice = torch.where(mask, target, 0)
+            target_skel = torch.where(mask, skel, 0)
             num_fg = mask.sum()
         else:
             target_dice = target
+            target_skel = skel
             mask = None
 
-        # Dice loss - pass target directly, SoftDiceLoss handles one-hot internally
-        dc_loss = self.dice(net_output, target_dice, loss_mask=mask) \
+        # Dice loss
+        dc_loss = self.dc(net_output, target_dice, loss_mask=mask) \\
             if self.weight_dice != 0 else 0
 
-        # CE loss
-        ce_loss = self.ce(net_output, target[:, 0]) \
-            if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
-
-        # Skeleton recall loss - pass target and optional pre-computed skeleton
-        skel_loss = self.skel_rec(net_output, target_dice, gt_skeleton=gt_skeleton, loss_mask=mask) \
+        # Skeleton recall loss - pass skeleton as target
+        srec_loss = self.srec(net_output, target_skel, loss_mask=mask) \\
             if self.weight_srec != 0 else 0
 
-        # Combine losses
-        total_loss = (
-            self.weight_dice * dc_loss +
-            self.weight_ce * ce_loss +
-            self.weight_srec * skel_loss
-        )
+        # CE loss
+        ce_loss = self.ce(net_output, target[:, 0]) \\
+            if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
 
-        return total_loss
+        result = self.weight_ce * ce_loss + self.weight_dice * dc_loss + self.weight_srec * srec_loss
+        return result
 '''
 
     compound_losses_path = loss_dir / "skeleton_losses.py"
@@ -610,225 +558,157 @@ class DC_SkelREC_and_CE_loss(nn.Module):
     medial_surface_code = '''"""
 Medial Surface Transform for computing 2D slice-based skeletonization.
 
-This transform computes the skeleton of segmentation masks by aggregating
-2D skeletonizations across ALL THREE axes (X, Y, Z).
+Based on villa implementation (ScrollPrize/villa):
+https://github.com/ScrollPrize/villa/blob/main/segmentation/models/arch/nnunet/nnunetv2/training/data_augmentation/custom_transforms/skeletonization.py
 
-Based on Host Baseline description:
-"instead of computing a 3D tree-like skeleton, tries to approximate
-(with some impurities) the medial surface of the labels by just aggregating
-per-slice 2D skeletonizations across the 3 different axes"
+NOTE: Despite host_solution.txt mentioning "3 different axes", the actual
+villa implementation uses Z-axis ONLY for skeletonization.
 
-Performance optimizations:
-- Uses joblib for parallel processing across slices
-- Caches results when possible
+The skeleton is computed by:
+1. For each Z-slice, compute 2D skeleton
+2. Optionally dilate (dilation twice per MIC-DKFZ)
+3. Multiply by original labels to retain class information
 """
 
 import numpy as np
 from typing import Tuple
-from concurrent.futures import ThreadPoolExecutor
-import os
+import torch
 
 try:
-    from skimage.morphology import skeletonize, dilation, ball
+    from skimage.morphology import skeletonize
     SKIMAGE_AVAILABLE = True
 except ImportError:
     SKIMAGE_AVAILABLE = False
 
-
-def _skeletonize_slice(args):
-    """Worker function for parallel skeletonization."""
-    slice_2d, has_content = args
-    if has_content:
-        return skeletonize(slice_2d)
-    return None
+try:
+    from scipy.ndimage import binary_dilation
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 
-def compute_medial_surface_3axes(
+def compute_medial_surface(
     segmentation: np.ndarray,
     do_tube: bool = True,
-    tube_radius: int = 2,
-    n_jobs: int = None
+    ignore_label: int = None
 ) -> np.ndarray:
     """
-    Compute medial surface by aggregating 2D skeletonization across all 3 axes.
+    Compute medial surface skeleton using Z-axis only 2D skeletonization.
 
-    This implements the Host Baseline approach:
-    - For each axis (Z, Y, X), compute 2D skeleton for each slice
-    - Combine all skeletons using OR operation
-    - Optionally dilate the result
-
-    This approximates the medial surface of sheet-like structures (papyrus surfaces).
-
-    Performance optimized with parallel processing.
+    This matches the villa implementation exactly.
 
     Args:
-        segmentation: Binary segmentation mask (D, H, W) or (1, D, H, W)
-        do_tube: Whether to dilate skeleton to create tube
-        tube_radius: Radius of dilation (number of iterations)
-        n_jobs: Number of parallel jobs (default: min(cpu_count, 8))
+        segmentation: Segmentation mask (C, D, H, W) or (D, H, W) with class labels
+        do_tube: Whether to dilate skeleton (dilation x 2 per villa)
+        ignore_label: Label to treat as background
 
     Returns:
-        Skeleton mask with same shape as input
+        Skeleton with same shape as input, containing class labels
     """
     if not SKIMAGE_AVAILABLE:
-        raise ImportError("scikit-image is required for skeletonization. Install with: pip install scikit-image")
+        raise ImportError("scikit-image required: pip install scikit-image")
+    if not SCIPY_AVAILABLE:
+        raise ImportError("scipy required: pip install scipy")
 
     # Handle channel dimension
     squeeze = False
     if segmentation.ndim == 4:
-        if segmentation.shape[0] != 1:
-            raise ValueError(f"Expected single channel, got {segmentation.shape[0]}")
-        segmentation = segmentation[0]
+        seg = segmentation[0]
         squeeze = True
+    else:
+        seg = segmentation
 
-    D, H, W = segmentation.shape
-    binary_seg = segmentation > 0.5
+    # Handle ignore label
+    if ignore_label is not None:
+        seg = np.where(seg == ignore_label, 0, seg)
 
-    # Check if there's any content to process
+    binary_seg = (seg > 0)
+
     if not binary_seg.any():
-        result = np.zeros_like(segmentation, dtype=np.float32)
+        result = np.zeros_like(seg, dtype=np.int16)
         if squeeze:
             result = result[np.newaxis, ...]
         return result
 
-    skeleton = np.zeros_like(segmentation, dtype=bool)
+    D, H, W = seg.shape
+    skeleton = np.zeros_like(binary_seg, dtype=bool)
 
-    # Determine number of workers
-    if n_jobs is None:
-        n_jobs = min(os.cpu_count() or 4, 8)
+    # Z-axis only (per villa implementation)
+    for z in range(D):
+        slice_2d = binary_seg[z]
+        if slice_2d.any():
+            skeleton[z] |= skeletonize(slice_2d)
 
-    # For small volumes, sequential is faster due to overhead
-    total_slices = D + H + W
-    use_parallel = total_slices > 50 and n_jobs > 1
+    # Convert to int16 and apply dilation if needed
+    skeleton = skeleton.astype(np.int16)
 
-    if use_parallel:
-        # Prepare all slices for parallel processing
-        z_slices = [(binary_seg[z].copy(), binary_seg[z].any()) for z in range(D)]
-        y_slices = [(binary_seg[:, y, :].copy(), binary_seg[:, y, :].any()) for y in range(H)]
-        x_slices = [(binary_seg[:, :, x].copy(), binary_seg[:, :, x].any()) for x in range(W)]
-
-        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
-            # Process Z-axis slices
-            z_results = list(executor.map(_skeletonize_slice, z_slices))
-            for z, skel in enumerate(z_results):
-                if skel is not None:
-                    skeleton[z] |= skel
-
-            # Process Y-axis slices
-            y_results = list(executor.map(_skeletonize_slice, y_slices))
-            for y, skel in enumerate(y_results):
-                if skel is not None:
-                    skeleton[:, y, :] |= skel
-
-            # Process X-axis slices
-            x_results = list(executor.map(_skeletonize_slice, x_slices))
-            for x, skel in enumerate(x_results):
-                if skel is not None:
-                    skeleton[:, :, x] |= skel
-    else:
-        # Sequential processing for small volumes
-        # Axis 0: Z-axis (XY slices)
-        for z in range(D):
-            slice_2d = binary_seg[z]
-            if slice_2d.any():
-                skeleton[z] |= skeletonize(slice_2d)
-
-        # Axis 1: Y-axis (XZ slices)
-        for y in range(H):
-            slice_2d = binary_seg[:, y, :]
-            if slice_2d.any():
-                skeleton[:, y, :] |= skeletonize(slice_2d)
-
-        # Axis 2: X-axis (YZ slices)
-        for x in range(W):
-            slice_2d = binary_seg[:, :, x]
-            if slice_2d.any():
-                skeleton[:, :, x] |= skeletonize(slice_2d)
-
-    # Optionally dilate to create tube
-    # MIC-DKFZ/Skeleton-Recall uses double dilation (not ball structuring element)
     if do_tube and skeleton.any():
-        from scipy.ndimage import binary_dilation
-        # Apply dilation twice as per MIC-DKFZ implementation: dilation(dilation(skel))
-        # This creates a ~2 pixel tube around the skeleton
-        skeleton = binary_dilation(skeleton)
-        skeleton = binary_dilation(skeleton)
+        skeleton = binary_dilation(skeleton).astype(np.int16)
+        skeleton = binary_dilation(skeleton).astype(np.int16)
 
-    result = skeleton.astype(np.float32)
+    # Multiply by original labels (per villa: skel *= seg_all[0].astype(np.int16))
+    skeleton = skeleton * seg.astype(np.int16)
 
     if squeeze:
-        result = result[np.newaxis, ...]
+        skeleton = skeleton[np.newaxis, ...]
 
-    return result
-
-
-# Alias for backward compatibility
-compute_medial_surface_2d = compute_medial_surface_3axes
+    return skeleton
 
 
 class MedialSurfaceTransform:
     """
     Batchgenerators-compatible transform for computing medial surface skeletons.
 
-    This transform adds a 'skeleton' key to the data dict containing the
-    skeletonized version of the segmentation mask using 3-axis aggregation.
+    Matches villa implementation for use in nnUNet data augmentation pipeline.
+    Adds a 'skel' key to the data dict containing the skeleton.
 
     Args:
-        do_tube: Whether to dilate skeleton
-        tube_radius: Dilation radius
-        skeleton_key: Key to store skeleton in data dict
-        n_jobs: Number of parallel jobs for skeletonization
+        do_tube: Whether to dilate skeleton (training=False, validation=True)
+        ignore_label: Label to treat as background
     """
 
     def __init__(
         self,
         do_tube: bool = True,
-        tube_radius: int = 2,
-        skeleton_key: str = "skeleton",
-        n_jobs: int = None
+        ignore_label: int = None
     ):
         self.do_tube = do_tube
-        self.tube_radius = tube_radius
-        self.skeleton_key = skeleton_key
-        self.n_jobs = n_jobs
+        self.ignore_label = ignore_label
 
-    def __call__(self, **data_dict) -> dict:
+    def apply(self, data_dict, **params) -> dict:
         """
         Apply transform to data dict.
 
         Expected keys:
-        - 'seg': Segmentation mask (B, C, D, H, W) or (C, D, H, W)
+        - 'segmentation': Segmentation tensor (C, D, H, W)
 
         Added keys:
-        - skeleton_key: Computed skeleton
+        - 'skel': Computed skeleton tensor
         """
-        seg = data_dict.get('seg')
+        seg = data_dict.get('segmentation')
         if seg is None:
             return data_dict
 
-        # Handle batch dimension
-        if seg.ndim == 5:
-            # Batch mode (B, C, D, H, W)
-            skeletons = []
-            for b in range(seg.shape[0]):
-                skel = compute_medial_surface_3axes(
-                    seg[b],
-                    do_tube=self.do_tube,
-                    tube_radius=self.tube_radius,
-                    n_jobs=self.n_jobs
-                )
-                skeletons.append(skel)
-            data_dict[self.skeleton_key] = np.stack(skeletons, axis=0)
+        # Convert to numpy if tensor
+        if isinstance(seg, torch.Tensor):
+            seg_np = seg.numpy()
         else:
-            # Single sample (C, D, H, W)
-            data_dict[self.skeleton_key] = compute_medial_surface_3axes(
-                seg,
-                do_tube=self.do_tube,
-                tube_radius=self.tube_radius,
-                n_jobs=self.n_jobs
-            )
+            seg_np = seg
 
+        # Compute skeleton
+        skeleton = compute_medial_surface(
+            seg_np,
+            do_tube=self.do_tube,
+            ignore_label=self.ignore_label
+        )
+
+        # Convert back to tensor
+        data_dict['skel'] = torch.from_numpy(skeleton)
         return data_dict
+
+    def __call__(self, **data_dict) -> dict:
+        """Alias for apply method."""
+        return self.apply(data_dict)
 '''
 
     medial_surface_path = transforms_dir / "medial_surface.py"
@@ -873,7 +753,6 @@ from typing import Tuple, Union, List, Dict
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.loss.skeleton_losses import DC_SkelREC_and_CE_loss
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
-from nnunetv2.training.data_augmentation.custom_transforms.medial_surface import compute_medial_surface_3axes
 
 
 class DeepSupervisionWrapperWithSkeleton(torch.nn.Module):
@@ -958,13 +837,14 @@ def compute_skeleton_batch(segmentation: np.ndarray, do_tube: bool = False) -> n
     Compute skeleton for a batch of segmentations.
 
     Uses Z-axis only 2D skeletonization per villa implementation.
+    Skeleton pixels retain the original label values (not just binary).
 
     Args:
-        segmentation: (B, C, D, H, W) or (B, D, H, W) array
+        segmentation: (B, C, D, H, W) or (B, 1, D, H, W) array with class labels
         do_tube: Whether to dilate skeleton (training=False, validation=True per villa)
 
     Returns:
-        Skeleton array with same shape as input
+        Skeleton array with same shape as input, containing class labels
     """
     from skimage.morphology import skeletonize
     from scipy.ndimage import binary_dilation
@@ -972,7 +852,8 @@ def compute_skeleton_batch(segmentation: np.ndarray, do_tube: bool = False) -> n
     # Handle different input shapes
     if segmentation.ndim == 5:
         batch_size = segmentation.shape[0]
-        seg_4d = segmentation[:, 0] if segmentation.shape[1] == 1 else segmentation[:, 1]
+        # Get the label channel (assumes channel 0 contains class labels)
+        seg_4d = segmentation[:, 0]
     elif segmentation.ndim == 4:
         batch_size = segmentation.shape[0]
         seg_4d = segmentation
@@ -985,24 +866,31 @@ def compute_skeleton_batch(segmentation: np.ndarray, do_tube: bool = False) -> n
         binary_seg = (seg_3d > 0).astype(bool)
 
         if not binary_seg.any():
-            skeletons.append(np.zeros_like(seg_3d, dtype=np.float32))
+            skeletons.append(np.zeros_like(seg_3d, dtype=np.int16))
             continue
 
         D, H, W = binary_seg.shape
         skeleton = np.zeros_like(binary_seg, dtype=bool)
 
-        # Z-axis only (per villa implementation - Y and X axes commented out)
+        # Z-axis only (per villa implementation)
         for z in range(D):
             slice_2d = binary_seg[z]
             if slice_2d.any():
                 skeleton[z] |= skeletonize(slice_2d)
 
+        # Convert to int16 for label storage
+        skeleton = skeleton.astype(np.int16)
+
         # Optional dilation (training=False, validation=True per villa)
         if do_tube and skeleton.any():
-            skeleton = binary_dilation(skeleton)
-            skeleton = binary_dilation(skeleton)
+            skeleton = binary_dilation(skeleton).astype(np.int16)
+            skeleton = binary_dilation(skeleton).astype(np.int16)
 
-        skeletons.append(skeleton.astype(np.float32))
+        # Multiply by original labels to retain class information (per villa)
+        # This ensures skeleton pixels have the correct class label, not just 1
+        skeleton = skeleton * seg_3d.astype(np.int16)
+
+        skeletons.append(skeleton)
 
     result = np.stack(skeletons, axis=0)
     # Add channel dimension if needed
@@ -1047,13 +935,21 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
         Build the combined Dice + CE + Skeleton Recall loss function.
 
         Returns:
-            Loss function wrapped for deep supervision if needed
+            Loss function (without deep supervision wrapper - handled in train_step)
         """
         # Get ignore label if set
         ignore_label = self.label_manager.ignore_label if hasattr(self.label_manager, 'ignore_label') else None
 
-        # Configure loss components (do_bg=False per villa implementation)
+        # Configure loss components (do_bg=False per villa/MIC-DKFZ implementation)
         soft_dice_kwargs = {
+            'batch_dice': self.configuration_manager.batch_dice,
+            'do_bg': False,
+            'smooth': 1e-5,
+            'ddp': self.is_ddp
+        }
+
+        # Skeleton recall uses same kwargs as Dice (per MIC-DKFZ compound_losses.py)
+        soft_skelrec_kwargs = {
             'batch_dice': self.configuration_manager.batch_dice,
             'do_bg': False,
             'smooth': 1e-5,
@@ -1064,16 +960,10 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
         if ignore_label is not None:
             ce_kwargs['ignore_index'] = ignore_label
 
-        skel_kwargs = {
-            'smooth': 1.0,
-            'num_iter': 10,
-            'do_bg': False
-        }
-
         loss = DC_SkelREC_and_CE_loss(
             soft_dice_kwargs=soft_dice_kwargs,
+            soft_skelrec_kwargs=soft_skelrec_kwargs,
             ce_kwargs=ce_kwargs,
-            skel_kwargs=skel_kwargs,
             weight_dice=self.weight_dice,
             weight_ce=self.weight_ce,
             weight_srec=self.weight_srec,
@@ -1081,10 +971,8 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
             dice_class=MemoryEfficientSoftDiceLoss
         )
 
-        # Note: We don't use deep supervision wrapper for skeleton loss
-        # because nnUNet's deep supervision outputs/targets have complex ordering.
-        # Instead, we handle deep supervision in train_step/validation_step
-        # by extracting only the final (full resolution) output and target.
+        # Note: We don't use deep supervision wrapper because skeleton needs
+        # special handling. train_step uses only full-resolution output.
 
         return loss
 
@@ -1257,7 +1145,7 @@ def verify_custom_trainer() -> bool:
         return False
 
 
-def create_host_baseline_plans() -> Path:
+def create_host_baseline_plans(debug_mode: bool = False) -> Path:
     """
     Create nnUNet plans file with Host Baseline configuration.
 
@@ -1269,6 +1157,9 @@ def create_host_baseline_plans() -> Path:
     - batch_size: 2
     - n_blocks_per_stage: [1, 3, 4, 6, 6, 6]
     - features_per_stage: [32, 64, 128, 256, 320, 320]
+
+    Args:
+        debug_mode: If True, use smaller patch_size and batch_size to prevent OOM
 
     Returns:
         Path to the generated plans file
@@ -1303,7 +1194,17 @@ def create_host_baseline_plans() -> Path:
         print("Creating new plans structure")
 
     # Override 3d_fullres configuration with Host Baseline settings
-    plans["configurations"]["3d_fullres"] = HOST_BASELINE_PLAN_CONFIG.copy()
+    config = HOST_BASELINE_PLAN_CONFIG.copy()
+
+    # Debug mode: use smaller settings to prevent OOM
+    if debug_mode:
+        config["patch_size"] = DEBUG_PATCH_SIZE
+        config["batch_size"] = DEBUG_BATCH_SIZE
+        print(f"\nDEBUG MODE: Using reduced settings")
+        print(f"  - patch_size: {DEBUG_PATCH_SIZE}")
+        print(f"  - batch_size: {DEBUG_BATCH_SIZE}")
+
+    plans["configurations"]["3d_fullres"] = config
     plans["plans_name"] = "nnUNetHostBaselinePlans"
 
     # Save as nnUNetHostBaselinePlans.json
@@ -1312,8 +1213,9 @@ def create_host_baseline_plans() -> Path:
         json.dump(plans, f, indent=4)
 
     print(f"\nHost Baseline plans created: {plans_path}")
-    print("  - patch_size: [192, 192, 192]")
-    print("  - batch_size: 2")
+    if not debug_mode:
+        print("  - patch_size: [192, 192, 192]")
+        print("  - batch_size: 2")
     print("  - n_stages: 6")
     print("  - features_per_stage: [32, 64, 128, 256, 320, 320]")
     print("  - n_blocks_per_stage: [1, 3, 4, 6, 6, 6]")
@@ -2178,6 +2080,7 @@ def run_host_baseline(
     do_train: bool = True,
     do_inference: bool = True,
     use_host_plans: bool = True,
+    debug_mode: bool = False,
     **kwargs
 ) -> bool:
     """
@@ -2204,13 +2107,17 @@ def run_host_baseline(
         do_train: Run training
         do_inference: Run inference
         use_host_plans: Use exact host plans configuration (recommended)
+        debug_mode: Use smaller patch_size/batch_size to prevent OOM
         **kwargs: Additional arguments passed to full_pipeline()
 
     Returns:
         True if pipeline completed successfully
     """
     print("=" * 60)
-    print("HOST BASELINE MODE")
+    if debug_mode:
+        print("HOST BASELINE MODE (DEBUG)")
+    else:
+        print("HOST BASELINE MODE")
     print("=" * 60)
     print("Using Host Baseline configuration:")
     print("  - Trainer: nnUNetTrainerMedialSurfaceRecall")
@@ -2236,7 +2143,7 @@ def run_host_baseline(
         plans_name = "nnUNetHostBaselinePlans"
         # Create host baseline plans file
         print("\nCreating Host Baseline plans...")
-        create_host_baseline_plans()
+        create_host_baseline_plans(debug_mode=debug_mode)
     else:
         plans_name = "nnUNetResEncUNetMPlans"
 
@@ -2261,6 +2168,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Debug mode (fast verification)
+  python surface-nnunet-training-local.py --debug --train
+  python surface-nnunet-training-local.py --debug --host-baseline --train
+
   # Host Baseline (recommended for best results)
   python surface-nnunet-training-local.py --host-baseline --epochs 1000
 
@@ -2282,6 +2193,12 @@ Examples:
   # Continue training from checkpoint
   python surface-nnunet-training-local.py --train --continue-training
 
+Debug Mode:
+  The --debug flag enables fast verification with minimal data:
+  - Uses only 1 training case (configurable with --debug-cases)
+  - Runs only 1 epoch
+  - Can be combined with --host-baseline for debugging custom trainer
+
 Host Baseline:
   The --host-baseline flag enables the competition host's solution:
   - Custom Trainer: nnUNetTrainerMedialSurfaceRecall (Skeleton Recall Loss)
@@ -2298,9 +2215,13 @@ Host Baseline:
 """
     )
 
-    # Host Baseline mode
+    # Special modes
     parser.add_argument("--host-baseline", action="store_true",
                         help="Run Host Baseline configuration (recommended)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Debug mode: fast verification with small data (1 case, 1 epoch)")
+    parser.add_argument("--debug-cases", type=int, default=DEBUG_MAX_CASES,
+                        help=f"Number of cases for debug mode (default: {DEBUG_MAX_CASES})")
 
     # Pipeline stages
     parser.add_argument("--train", action="store_true", help="Run training")
@@ -2342,6 +2263,25 @@ Host Baseline:
 
     args = parser.parse_args()
 
+    # Debug mode: override settings for fast verification
+    if args.debug:
+        print("=" * 60)
+        print("DEBUG MODE")
+        print("=" * 60)
+        print(f"  - Epochs: {DEBUG_EPOCHS}")
+        print(f"  - Max cases: {args.debug_cases}")
+        print("=" * 60)
+        # Override settings
+        if args.epochs is None:
+            args.epochs = DEBUG_EPOCHS
+        if args.max_cases is None:
+            args.max_cases = args.debug_cases
+        if args.gpus is None:
+            args.gpus = 1  # Use single GPU to avoid DDP batch size issues
+        # Set environment for faster validation
+        os.environ["nnUNet_n_proc_DA"] = "2"
+        os.environ["nnUNet_compile"] = "false"  # Disable torch.compile for faster startup
+
     # Host Baseline mode
     if args.host_baseline:
         # Convert fold to int if numeric
@@ -2355,6 +2295,7 @@ Host Baseline:
             do_train=args.train or (not args.train and not args.inference),  # Default to train
             do_inference=args.inference or (not args.train and not args.inference),  # Default to both
             use_host_plans=not args.no_host_plans,
+            debug_mode=args.debug,
             do_prepare_raw=not args.skip_raw_prep,
             fold=fold,
             num_gpus=args.gpus,

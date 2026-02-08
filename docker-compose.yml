@@ -1,0 +1,51 @@
+# Vesuvius nnUNet Training Environment
+#
+# Usage:
+#   docker-compose build        # Build image (first time or after Dockerfile changes)
+#   docker-compose up -d        # Start container in background
+#   docker-compose exec nnunet bash   # Login to container
+#   docker-compose down         # Stop container
+#
+# Inside container:
+#   python surface-nnunet-training-local.py --train --epochs 50
+#   python surface-nnunet-training-local.py --host-baseline
+
+services:
+  nnunet:
+    build: .
+    image: vesvius-nnunet:latest
+    container_name: vesvius-nnunet
+
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Shared memory for PyTorch DataLoader
+    shm_size: 32g
+    ipc: host
+
+    # Keep container running
+    stdin_open: true
+    tty: true
+
+    # Volume mounts
+    volumes:
+      - .:/workspace
+      - ./data:/kaggle/input
+      - ./nnunet_output:/kaggle/working
+      - ./nnunet_work:/kaggle/temp
+
+    # nnUNet environment variables
+    environment:
+      - nnUNet_raw=/kaggle/temp/nnUNet_data/nnUNet_raw
+      - nnUNet_preprocessed=/kaggle/working/nnUNet_preprocessed
+      - nnUNet_results=/kaggle/working/nnUNet_results
+      - nnUNet_USE_BLOSC2=1
+      - nnUNet_compile=false
+
+    working_dir: /workspace

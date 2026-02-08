@@ -24,6 +24,20 @@ docker-compose up -d
 docker-compose exec nnunet bash
 ```
 
+### 前処理（初回のみ）
+
+学習前にnnUNetの前処理を実行:
+
+```bash
+# 通常の前処理
+python surface-nnunet-preprocessing.py
+
+# ケース数を制限（デバッグ用）
+python surface-nnunet-preprocessing.py --max-cases 5
+```
+
+前処理済みデータは `nnunet_output/nnUNet_preprocessed/` に保存されます。
+
 ### 学習の実行
 
 コンテナ内で以下を実行:

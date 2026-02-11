@@ -1,0 +1,18 @@
+{
+  "id": "toseihatori/vesvius-nnunet-submission",
+  "title": "Vesvius nnUNet Submission",
+  "code_file": "submission.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "dataset_sources": [
+    "toseihatori/vesvius-model-weights",
+    "toseihatori/vesvius-nnunet-packages"
+  ],
+  "competition_sources": [
+    "vesuvius-challenge-surface-detection"
+  ],
+  "kernel_sources": []
+}

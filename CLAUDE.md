@@ -109,3 +109,26 @@ docker system prune
 ```bash
 kaggle datasets version -p <ディレクトリパス> -m "更新メッセージ" --dir-mode zip
 ```
+
+## Kaggle 提出
+
+詳細な手順は [docs/kaggle_submission_guide.md](docs/kaggle_submission_guide.md) を参照。
+
+### クイックリファレンス
+
+```bash
+# Kernel を push
+cd kaggle_kernel
+kaggle kernels push
+
+# Competition に提出
+kaggle competitions submit \
+  -c vesuvius-challenge-surface-detection \
+  -k toseihatori/vesvius-nnunet-submission \
+  -f submission.zip \
+  -v <version番号> \
+  -m "説明"
+
+# 提出の監視
+python monitor_submission.py --competition vesuvius-challenge-surface-detection
+```

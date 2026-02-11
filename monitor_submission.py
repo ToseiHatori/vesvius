@@ -70,7 +70,9 @@ def setup_logging(log_dir: str, submission) -> logging.Logger:
 def get_status(submission) -> str:
     """statusを文字列として取得する。enum/文字列どちらにも対応。"""
     status = submission.status
-    return status.value if hasattr(status, "value") else str(status)
+    if hasattr(status, "name"):
+        return status.name.lower()  # PENDING -> pending, COMPLETE -> complete
+    return str(status).lower()
 
 
 def monitor(competition: str, interval: int, log_dir: str) -> None:
@@ -99,6 +101,9 @@ def monitor(competition: str, interval: int, log_dir: str) -> None:
             logger.info(f"Submission ref={ref} not found. Stopping.")
             return
 
+        # submit_time is timezone-naive, assume it's UTC
+        if submit_time.tzinfo is None:
+            submit_time = submit_time.replace(tzinfo=timezone.utc)
         elapsed = datetime.now(timezone.utc) - submit_time
         elapsed_min = elapsed.total_seconds() / 60
 

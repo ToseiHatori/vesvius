@@ -183,10 +183,27 @@ kaggle competitions submit \
 ### 6. 提出の監視
 
 ```bash
+# フォアグラウンドで実行
 python monitor_submission.py \
   --competition vesuvius-challenge-surface-detection \
   --interval 300 \
   --log-dir logs
+
+# バックグラウンドで実行（ターミナルを閉じても継続）
+nohup python monitor_submission.py \
+  --competition vesuvius-challenge-surface-detection \
+  --interval 60 \
+  --log-dir logs \
+  > logs/monitor.out 2>&1 &
+
+# プロセス確認
+ps aux | grep monitor_submission
+
+# ログをリアルタイムで確認
+tail -f logs/monitor.out
+
+# 停止
+pkill -f monitor_submission.py
 ```
 
 ## トラブルシューティング

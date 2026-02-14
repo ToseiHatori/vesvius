@@ -129,6 +129,62 @@ kaggle competitions submit \
   -v <version番号> \
   -m "説明"
 
-# 提出の監視
-python monitor_submission.py --competition vesuvius-challenge-surface-detection
+# 提出の監視（必ずnohupで実行すること！）
+nohup python monitor_submission.py --competition vesuvius-challenge-surface-detection > logs/monitor_v<version>.log 2>&1 &
 ```
+
+### 重要: 提出時の必須手順
+
+**提出後は必ず `monitor_submission.py` を nohup で実行すること。**
+
+これにより提出の経過時間が `logs/` に記録され、`docs/submission_history.md` の更新に必要な情報が残る。
+
+## 実験管理
+
+### ディレクトリ構成
+
+```
+docs/
+├── EXPERIMENTS.md              # 実験結果サマリー（メイン）
+├── results/                    # 評価結果CSV
+│   ├── fold0_evaluation.csv
+│   ├── fold1_evaluation.csv
+│   └── ...
+├── kaggle_submission_guide.md  # 提出ガイド
+├── submission_history.md       # 提出履歴
+└── postprocess_comparison.md   # 後処理比較分析
+```
+
+### 評価の実行
+
+```bash
+# Validation TIFの評価（postprocessなし）
+docker-compose exec nnunet python /workspace/evaluate_validation_tif.py \
+  --pred-dir /workspace/nnunet_output/nnUNet_results/<model>/fold_X/validation \
+  --gt-dir /workspace/nnunet_output/nnUNet_preprocessed/Dataset100_VesuviusSurface/gt_segmentations \
+  --workers 8 \
+  --output-csv /workspace/docs/results/<name>.csv
+
+# 後処理付き評価（NPZファイルが必要）
+docker-compose exec nnunet python /workspace/evaluate_metrics.py \
+  --npz-dir <npz_dir> \
+  --gt-dir <gt_dir> \
+  --postprocess all \
+  --output-csv /workspace/docs/results/<name>.csv
+```
+
+### 結果の記録
+
+1. CSVは `docs/results/` に保存
+2. 主要な結果を `docs/EXPERIMENTS.md` に追記
+3. Kaggle提出時は `docs/submission_history.md` を更新
+
+### 評価指標
+
+```
+Leaderboard = 0.3 * TopoScore + 0.35 * SurfaceDice + 0.35 * VOI_score
+```
+
+- **TopoScore**: トポロジー保存（連結性）の評価
+- **SurfaceDice**: 表面の一致度（tolerance=2.0）
+- **VOI_score**: Variation of Information（セグメンテーション品質）

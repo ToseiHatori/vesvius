@@ -6,8 +6,11 @@ This script runs inside the Docker container (via docker-compose).
 Paths are configured to match the docker-compose.yml volume mounts.
 
 Usage:
-    # Inside docker container
+    # Inside docker container (default: 3d_fullres)
     python surface-nnunet-preprocessing.py
+
+    # Use 3d_lowres configuration (matches Kaggle notebook baseline)
+    python surface-nnunet-preprocessing.py --config 3d_lowres
 
     # With custom input directory
     python surface-nnunet-preprocessing.py --input-dir /path/to/data
@@ -52,7 +55,8 @@ DATASET_NAME = f"Dataset{DATASET_ID:03d}_VesuviusSurface"
 # PREPROCESSING CONFIGURATION
 # =============================================================================
 
-CONFIGURATION = "3d_fullres"
+DEFAULT_CONFIGURATION = "3d_fullres"
+AVAILABLE_CONFIGURATIONS = ["2d", "3d_lowres", "3d_fullres", "3d_cascade_fullres"]
 PLANNER = "nnUNetPlannerResEncM"
 NUM_WORKERS = os.cpu_count() or 4
 COMMAND_TIMEOUT: Optional[int] = None
@@ -277,7 +281,7 @@ def run_preprocessing(
 ) -> bool:
     """Run nnUNet preprocessing."""
     if configurations is None:
-        configurations = [CONFIGURATION]
+        configurations = [DEFAULT_CONFIGURATION]
 
     cmd = f"nnUNetv2_plan_and_preprocess -d {dataset_id:03d} -np {num_workers}"
     cmd += f" -pl {planner}"
@@ -296,8 +300,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Run preprocessing with default paths
+    # Run preprocessing with default configuration (3d_fullres)
     python surface-nnunet-preprocessing.py
+
+    # Use 3d_lowres configuration (matches Kaggle notebook baseline)
+    python surface-nnunet-preprocessing.py --config 3d_lowres
 
     # Specify input directory
     python surface-nnunet-preprocessing.py --input-dir /kaggle/input/vesuvius-challenge-surface-detection
@@ -310,6 +317,9 @@ Examples:
 """
     )
 
+    parser.add_argument("--config", default=DEFAULT_CONFIGURATION,
+                        choices=AVAILABLE_CONFIGURATIONS,
+                        help=f"nnUNet configuration (default: {DEFAULT_CONFIGURATION})")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR,
                         help=f"Input data directory (default: {DEFAULT_INPUT_DIR})")
     parser.add_argument("--max-cases", type=int, default=None,
@@ -323,13 +333,15 @@ Examples:
 
     args = parser.parse_args()
 
+    config = args.config
     input_dir = args.input_dir
     use_symlinks = not args.no_symlinks
     num_workers = args.num_workers or NUM_WORKERS
 
     print("=" * 60)
-    print("VESUVIUS PREPROCESSING - 3d_fullres (Docker)")
+    print(f"VESUVIUS PREPROCESSING - {config} (Docker)")
     print("=" * 60)
+    print(f"Configuration: {config}")
     print(f"Input directory: {input_dir}")
     print(f"Max cases: {args.max_cases or 'all'}")
     print(f"Use symlinks: {use_symlinks}")
@@ -363,11 +375,11 @@ Examples:
         print("\n[1/2] Skipping dataset preparation...")
 
     # Step 3: Run preprocessing
-    print("\n[2/2] Running nnUNet preprocessing...")
+    print(f"\n[2/2] Running nnUNet preprocessing ({config})...")
     success = run_preprocessing(
         planner=PLANNER,
         num_workers=num_workers,
-        configurations=[CONFIGURATION]
+        configurations=[config]
     )
 
     print("\n" + "=" * 60)

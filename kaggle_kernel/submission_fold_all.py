@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres, fold_0 + fold_1 ensemble (2x T4 GPU), no TTA, hysteresis post-processing
+nnUNet 3d_fullres, fold_all (single model, 1x T4 GPU), no TTA, hysteresis post-processing
 """
 
 import os
 import subprocess
 import sys
-import threading
-from queue import Queue
 
 # =============================================================================
 # INSTALL DEPENDENCIES
@@ -16,7 +14,6 @@ from queue import Queue
 
 def install_packages():
     """Install required packages from offline source."""
-    # Install without dependency check - Kaggle has most dependencies pre-installed
     pkg_dir = "/kaggle/input/vesvius-nnunet-packages"
     packages = [
         "imagecodecs-2026.1.14-cp311-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
@@ -43,7 +40,6 @@ install_packages()
 
 import json
 import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -61,23 +57,17 @@ INPUT_DIR = Path("/kaggle/input/vesuvius-challenge-surface-detection")
 OUTPUT_DIR = Path("/kaggle/working")
 MODEL_DATASET_DIR = Path("/kaggle/input/vesvius-model-weights")
 
-# Model configuration
+# Model configuration - fold_all with 3d_fullres
 DATASET_ID = 100
 DATASET_NAME = f"Dataset{DATASET_ID:03d}_VesuviusSurface"
 TRAINER = "nnUNetTrainer"
 PLANS = "nnUNetResEncUNetMPlans"
-CONFIG = "3d_lowres"
-FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
-
-# GPU configuration for parallel inference
-GPU_FOLD_MAP = {
-    "0": 0,  # fold_0 -> GPU 0
-    "1": 1,  # fold_1 -> GPU 1
-}
+CONFIG = "3d_fullres"
+FOLD = "all"
 
 # Inference settings
 DISABLE_TTA = True  # Faster inference
-USE_HYSTERESIS = True  # Hysteresis post-processing (validation: 0.5886 vs 0.5690 for argmax)
+USE_HYSTERESIS = True  # Hysteresis post-processing
 
 # =============================================================================
 # POST-PROCESSING
@@ -123,14 +113,6 @@ def postprocess_hysteresis(
 ) -> np.ndarray:
     """
     Post-processing with hysteresis thresholding.
-
-    This method achieved the best validation score in our experiments:
-    - Leaderboard: 0.6010 (vs 0.5690 for argmax)
-    - TopoScore: 0.3224 (vs 0.2436 for argmax)
-
-    Optimized via grid search over fold_0 and fold_1:
-    - t_low=0.3 consistently best across both folds
-    - t_high=0.85 optimal (0.75-0.85 similar performance)
 
     Steps:
     1. 3D Hysteresis thresholding: propagate from high confidence to low
@@ -183,19 +165,12 @@ def postprocess_hysteresis(
 
 def setup_environment():
     """Set up nnUNet environment variables."""
-    # Kaggle dataset extracts zip contents directly without parent folder
-    # Actual structure: /kaggle/input/vesvius-model-weights/nnUNetTrainer__...
-    # nnUNet expects: {nnUNet_results}/Dataset100_VesuviusSurface/nnUNetTrainer__...
-    # Solution: Create symlink to match expected structure
-
-    # Use working directory for nnUNet_results so we can create symlinks
     results_dir = OUTPUT_DIR / "nnUNet_results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create symlink: Dataset100_VesuviusSurface -> actual model location's parent
+    # Create symlink: Dataset100_VesuviusSurface -> actual model location
     dataset_link = results_dir / DATASET_NAME
     if not dataset_link.exists():
-        # The actual trainer folder is directly in MODEL_DATASET_DIR
         dataset_link.symlink_to(MODEL_DATASET_DIR)
 
     os.environ["nnUNet_raw"] = str(OUTPUT_DIR / "nnUNet_raw")
@@ -205,23 +180,19 @@ def setup_environment():
     print(f"nnUNet_results: {results_dir}")
     print(f"Symlink: {dataset_link} -> {MODEL_DATASET_DIR}")
 
-    # Verify all fold models exist
-    model_dirs = {}
-    for fold in FOLDS:
-        model_dir = results_dir / DATASET_NAME / f"{TRAINER}__{PLANS}__{CONFIG}" / f"fold_{fold}"
-        checkpoint = model_dir / "checkpoint_final.pth"
+    # Verify model exists
+    model_dir = results_dir / DATASET_NAME / f"{TRAINER}__{PLANS}__{CONFIG}" / f"fold_{FOLD}"
+    checkpoint = model_dir / "checkpoint_final.pth"
 
-        if not checkpoint.exists():
-            print(f"ERROR: Checkpoint not found: {checkpoint}")
-            print(f"Available files in {MODEL_DATASET_DIR}:")
-            for p in MODEL_DATASET_DIR.rglob("*"):
-                print(f"  {p}")
-            sys.exit(1)
+    if not checkpoint.exists():
+        print(f"ERROR: Checkpoint not found: {checkpoint}")
+        print(f"Available files in {MODEL_DATASET_DIR}:")
+        for p in MODEL_DATASET_DIR.rglob("*"):
+            print(f"  {p}")
+        sys.exit(1)
 
-        print(f"Model checkpoint (fold_{fold}): {checkpoint}")
-        model_dirs[fold] = model_dir
-
-    return model_dirs
+    print(f"Model checkpoint: {checkpoint}")
+    return model_dir
 
 # =============================================================================
 # DATA PREPARATION
@@ -233,46 +204,23 @@ def create_spacing_json(output_path: Path, spacing: tuple = (1.0, 1.0, 1.0)):
     with open(output_path, "w") as f:
         json.dump(json_data, f)
 
-
-def prepare_input_images(input_images: list, output_dir: Path) -> list:
-    """Prepare input images for nnUNet inference."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    case_ids = []
-    for img_path in input_images:
-        case_id = img_path.stem
-        dest_path = output_dir / f"{case_id}_0000.tif"
-        json_path = output_dir / f"{case_id}_0000.json"
-
-        # Symlink image
-        if not dest_path.exists():
-            dest_path.symlink_to(img_path.resolve())
-
-        # Create JSON sidecar
-        create_spacing_json(json_path)
-        case_ids.append(case_id)
-
-    return case_ids
-
 # =============================================================================
 # INFERENCE
 # =============================================================================
 
-def run_inference_single_case_fold(
-    case_input_dir: Path,
-    output_dir: Path,
-    fold: str,
-    gpu_id: int,
-    result_queue: Queue
-) -> None:
-    """Run nnUNet inference on a single case with a specific fold and GPU.
+def run_inference(case_input_dir: Path, output_dir: Path) -> bool:
+    """Run nnUNet inference on a single case.
 
-    This function is designed to be run in a thread.
-    Results are put into result_queue as (fold, success, error_msg).
+    Args:
+        case_input_dir: Directory containing the input case
+        output_dir: Output directory for predictions
+
+    Returns:
+        True if successful, False otherwise
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} nnUNetv2_predict -d {DATASET_ID:03d} -c {CONFIG} -f {fold}"
+    cmd = f"nnUNetv2_predict -d {DATASET_ID:03d} -c {CONFIG} -f {FOLD}"
     cmd += f" -i {case_input_dir} -o {output_dir} -p {PLANS} -tr {TRAINER}"
     cmd += " -npp 2 -nps 2 --verbose"
 
@@ -282,64 +230,23 @@ def run_inference_single_case_fold(
     if USE_HYSTERESIS:
         cmd += " --save_probabilities"
 
-    print(f"[GPU {gpu_id}, fold_{fold}] Running: {cmd}")
+    print(f"Running: {cmd}")
 
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
     if result.returncode != 0:
-        error_msg = f"STDOUT:\n{result.stdout[-1000:]}\nSTDERR:\n{result.stderr[-1000:]}"
-        result_queue.put((fold, False, error_msg))
-    else:
-        result_queue.put((fold, True, None))
+        print(f"STDOUT:\n{result.stdout[-2000:]}")
+        print(f"STDERR:\n{result.stderr[-2000:]}")
+        return False
+
+    return True
 
 
-def run_inference_parallel(case_input_dir: Path, output_dirs: dict) -> bool:
-    """Run inference on all folds in parallel using multiple GPUs.
-
-    Args:
-        case_input_dir: Directory containing the input case
-        output_dirs: Dict mapping fold -> output directory
-
-    Returns:
-        True if all folds succeeded, False otherwise
-    """
-    result_queue = Queue()
-    threads = []
-
-    for fold in FOLDS:
-        gpu_id = GPU_FOLD_MAP[fold]
-        output_dir = output_dirs[fold]
-
-        t = threading.Thread(
-            target=run_inference_single_case_fold,
-            args=(case_input_dir, output_dir, fold, gpu_id, result_queue)
-        )
-        threads.append(t)
-        t.start()
-
-    # Wait for all threads to complete
-    for t in threads:
-        t.join()
-
-    # Check results
-    all_success = True
-    while not result_queue.empty():
-        fold, success, error_msg = result_queue.get()
-        if not success:
-            print(f"[fold_{fold}] Inference FAILED!")
-            print(error_msg)
-            all_success = False
-
-    return all_success
-
-
-def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str) -> bool:
-    """Ensemble predictions from multiple folds and convert to TIFF.
-
-    Averages probabilities from all folds before applying hysteresis post-processing.
+def convert_to_tiff(pred_dir: Path, output_dir: Path, case_id: str) -> bool:
+    """Convert prediction to TIFF with post-processing.
 
     Args:
-        pred_dirs: Dict mapping fold -> prediction directory
+        pred_dir: Directory containing nnUNet predictions
         output_dir: Output directory for final TIFF
         case_id: Case identifier
 
@@ -349,66 +256,38 @@ def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if USE_HYSTERESIS:
-        # Load and average probabilities from all folds
-        probs_list = []
-        npz_paths = []
+        npz_path = pred_dir / f"{case_id}.npz"
+        if not npz_path.exists():
+            print(f"WARNING: NPZ not found: {npz_path}")
+            return False
 
-        for fold in FOLDS:
-            npz_path = pred_dirs[fold] / f"{case_id}.npz"
-            if not npz_path.exists():
-                print(f"WARNING: NPZ not found for fold_{fold}: {npz_path}")
-                return False
+        data = np.load(npz_path)
+        probs = data['probabilities']
+        del data
 
-            data = np.load(npz_path)
-            probs_list.append(data['probabilities'])
-            npz_paths.append(npz_path)
-            del data
-
-        # Average probabilities
-        probs_avg = np.mean(probs_list, axis=0)
-        del probs_list
-
-        # Hysteresis post-processing on averaged probabilities
-        pred = postprocess_hysteresis(probs_avg)
-        del probs_avg
-
-        tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
-        del pred
-
-        # Free disk space - delete all NPZ files
-        for npz_path in npz_paths:
-            npz_path.unlink()
-
-        print(f"  Ensembled {len(FOLDS)} folds and converted: {case_id}")
-        return True
-    else:
-        # Fallback: use argmax on averaged probabilities or majority vote on TIFFs
-        preds_list = []
-        tif_paths = []
-
-        for fold in FOLDS:
-            tif_path = pred_dirs[fold] / f"{case_id}.tif"
-            if not tif_path.exists():
-                print(f"WARNING: TIFF not found for fold_{fold}: {tif_path}")
-                return False
-
-            pred = tifffile.imread(str(tif_path))
-            preds_list.append(pred)
-            tif_paths.append(tif_path)
-
-        # Majority vote (for binary: sum > len/2)
-        pred_sum = np.sum(preds_list, axis=0)
-        pred = (pred_sum > len(FOLDS) / 2).astype(np.uint8)
-        del preds_list, pred_sum
+        # Hysteresis post-processing
+        pred = postprocess_hysteresis(probs)
+        del probs
 
         tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
         del pred
 
         # Free disk space
-        for tif_path in tif_paths:
-            tif_path.unlink()
+        npz_path.unlink()
 
-        print(f"  Ensembled {len(FOLDS)} folds (majority vote): {case_id}")
+        print(f"  Converted with hysteresis: {case_id}")
+        return True
+    else:
+        # Fallback: just copy the TIFF
+        tif_path = pred_dir / f"{case_id}.tif"
+        if not tif_path.exists():
+            print(f"WARNING: TIFF not found: {tif_path}")
+            return False
+
+        shutil.copy(tif_path, output_dir / f"{case_id}.tif")
+        tif_path.unlink()
+
+        print(f"  Copied: {case_id}")
         return True
 
 # =============================================================================
@@ -439,16 +318,14 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 
 def main():
     print("=" * 60)
-    print("Vesuvius nnUNet Submission (2-GPU Ensemble)")
-    print(f"Config: {CONFIG}, Folds: {', '.join(FOLDS)}")
-    print(f"GPUs: {', '.join(f'fold_{f}->GPU{GPU_FOLD_MAP[f]}' for f in FOLDS)}")
+    print("Vesuvius nnUNet Submission (fold_all, single model)")
+    print(f"Config: {CONFIG}, Fold: {FOLD}")
     print(f"TTA: {'disabled' if DISABLE_TTA else 'enabled'}")
     print(f"Post-processing: {'hysteresis' if USE_HYSTERESIS else 'argmax'}")
-    print(f"Ensemble: probability averaging")
     print("=" * 60)
 
     # Setup environment
-    model_dirs = setup_environment()
+    model_dir = setup_environment()
 
     # Find test images
     test_images_dir = INPUT_DIR / "test_images"
@@ -459,17 +336,15 @@ def main():
         print("ERROR: No test images found!")
         return 1
 
-    # Prepare directories for each fold
-    pred_dirs = {}
-    for fold in FOLDS:
-        pred_dirs[fold] = OUTPUT_DIR / f"predictions_fold{fold}"
-        pred_dirs[fold].mkdir(parents=True, exist_ok=True)
+    # Prepare directories
+    pred_dir = OUTPUT_DIR / "predictions_raw"
+    pred_dir.mkdir(parents=True, exist_ok=True)
 
     predictions_tiff_dir = OUTPUT_DIR / "predictions_tiff"
     predictions_tiff_dir.mkdir(parents=True, exist_ok=True)
 
-    # Process each case: run all folds in parallel, then ensemble
-    print(f"\nProcessing cases with parallel inference on {len(FOLDS)} folds...")
+    # Process each case
+    print(f"\nProcessing cases...")
     for i, img_path in enumerate(test_images):
         case_id = img_path.stem
         print(f"\n[{i+1}/{len(test_images)}] Processing: {case_id}")
@@ -486,14 +361,14 @@ def main():
         dest_path.symlink_to(img_path.resolve())
         create_spacing_json(json_path)
 
-        # Run inference on all folds in parallel
-        success = run_inference_parallel(case_input_dir, pred_dirs)
+        # Run inference
+        success = run_inference(case_input_dir, pred_dir)
         if not success:
             print(f"ERROR: Inference failed for {case_id}!")
             return 1
 
-        # Ensemble predictions and convert to TIFF
-        ensemble_and_convert_to_tiff(pred_dirs, predictions_tiff_dir, case_id)
+        # Convert to TIFF with post-processing
+        convert_to_tiff(pred_dir, predictions_tiff_dir, case_id)
 
         # Cleanup temp input
         shutil.rmtree(case_input_dir)

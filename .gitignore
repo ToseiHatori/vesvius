@@ -13,3 +13,12 @@ kaggle-upload/
 # Temporary files
 __pycache__/
 .ipynb_checkpoints/
+
+# Jupyter notebooks
+*.ipynb
+
+# CSV files (evaluation results tracked in docs/results/)
+docs/hysteresis_grid_search_fold1.csv
+
+# Kaggle dataset upload directory
+kaggle_dataset/

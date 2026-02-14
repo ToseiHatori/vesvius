@@ -13,6 +13,7 @@ kaggle-upload/
 # Temporary files
 __pycache__/
 .ipynb_checkpoints/
+output/
 
 # Jupyter notebooks
 *.ipynb

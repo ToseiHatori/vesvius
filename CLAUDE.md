@@ -135,7 +135,7 @@ nohup python monitor_submission.py --competition vesuvius-challenge-surface-dete
 
 ### 重要: 提出時の必須手順
 
-**提出後は必ず `monitor_submission.py` を nohup で実行すること。**
+**提出後は必ず `monitor_submission.py` を pipx の pythonで、 nohup で実行すること。**
 
 これにより提出の経過時間が `logs/` に記録され、`docs/submission_history.md` の更新に必要な情報が残る。
 

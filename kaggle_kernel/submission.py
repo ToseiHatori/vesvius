@@ -274,7 +274,7 @@ def run_inference_single_case_fold(
 
     cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} nnUNetv2_predict -d {DATASET_ID:03d} -c {CONFIG} -f {fold}"
     cmd += f" -i {case_input_dir} -o {output_dir} -p {PLANS} -tr {TRAINER}"
-    cmd += " -npp 2 -nps 2 --verbose"
+    cmd += " -npp 1 -nps 1 --verbose"
 
     if DISABLE_TTA:
         cmd += " --disable_tta"

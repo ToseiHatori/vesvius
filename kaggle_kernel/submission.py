@@ -486,21 +486,24 @@ def main():
         print("ERROR: No test images found!")
         return 1
 
-    # Prepare directories for each fold
-    pred_dirs = {}
-    for fold in FOLDS:
-        pred_dirs[fold] = OUTPUT_DIR / f"predictions_fold{fold}"
-        pred_dirs[fold].mkdir(parents=True, exist_ok=True)
+    # Prepare two sets of directories for double-buffering (avoid race condition)
+    # While post-processing reads from pred_dirs_0, inference writes to pred_dirs_1
+    pred_dirs_list = []
+    for buf_idx in range(2):
+        pred_dirs = {}
+        for fold in FOLDS:
+            pred_dirs[fold] = OUTPUT_DIR / f"predictions_fold{fold}_buf{buf_idx}"
+            pred_dirs[fold].mkdir(parents=True, exist_ok=True)
+        pred_dirs_list.append(pred_dirs)
 
     predictions_tiff_dir = OUTPUT_DIR / "predictions_tiff"
     predictions_tiff_dir.mkdir(parents=True, exist_ok=True)
 
     # Pipeline processing: overlap preparation and post-processing with inference
-    # Use two input directories alternately to allow parallel preparation
+    # Use double-buffering for both input and output directories
     print(f"\nProcessing cases with pipelined inference on {len(FOLDS)} folds...")
 
     case_input_dirs = [OUTPUT_DIR / "case_input_0", OUTPUT_DIR / "case_input_1"]
-    postprocess_futures: list[Future] = []
     inference_failed = False
 
     # ThreadPoolExecutor for background tasks (preparation + post-processing)
@@ -508,15 +511,30 @@ def main():
         # Prepare first case synchronously
         first_case_id = prepare_single_case(test_images[0], case_input_dirs[0])
         prepare_future: Optional[Future] = None
+        # Track post-processing futures for each buffer separately
+        postprocess_futures: list[Optional[tuple[str, Future]]] = [None, None]
 
         for i, img_path in enumerate(test_images):
             case_id = img_path.stem
-            current_input_dir = case_input_dirs[i % 2]
+            buf_idx = i % 2
+            current_input_dir = case_input_dirs[buf_idx]
+            current_pred_dirs = pred_dirs_list[buf_idx]
 
             # Wait for preparation if running in background (from previous iteration)
             if prepare_future is not None:
                 prepare_future.result()
                 prepare_future = None
+
+            # Wait for post-processing using the SAME buffer to complete
+            # This ensures we don't overwrite pred_dirs while they're being read
+            if postprocess_futures[buf_idx] is not None:
+                prev_case_id, future = postprocess_futures[buf_idx]
+                result = future.result()
+                if not result:
+                    print(f"ERROR: Post-processing failed for {prev_case_id}!")
+                    inference_failed = True
+                    break
+                postprocess_futures[buf_idx] = None
 
             print(f"\n[{i+1}/{len(test_images)}] Processing: {case_id}")
 
@@ -528,33 +546,42 @@ def main():
                 )
 
             # Run inference on all folds in parallel (GPU-bound)
-            success = run_inference_parallel(current_input_dir, pred_dirs)
+            success = run_inference_parallel(current_input_dir, current_pred_dirs)
             if not success:
                 print(f"ERROR: Inference failed for {case_id}!")
                 inference_failed = True
                 break
 
             # Start post-processing in background (CPU-bound: NPZ load, ensemble, hysteresis)
-            postprocess_future = executor.submit(
-                ensemble_and_convert_to_tiff, pred_dirs, predictions_tiff_dir, case_id
+            postprocess_futures[buf_idx] = (
+                case_id,
+                executor.submit(
+                    ensemble_and_convert_to_tiff, current_pred_dirs, predictions_tiff_dir, case_id
+                )
             )
-            postprocess_futures.append((case_id, postprocess_future))
 
-        # Wait for all post-processing to complete
-        print("\nWaiting for post-processing to complete...")
-        for case_id, future in postprocess_futures:
-            result = future.result()
-            if not result:
-                print(f"ERROR: Post-processing failed for {case_id}!")
-                inference_failed = True
+        # Wait for all remaining post-processing to complete
+        if not inference_failed:
+            print("\nWaiting for post-processing to complete...")
+            for buf_idx in range(2):
+                if postprocess_futures[buf_idx] is not None:
+                    prev_case_id, future = postprocess_futures[buf_idx]
+                    result = future.result()
+                    if not result:
+                        print(f"ERROR: Post-processing failed for {prev_case_id}!")
+                        inference_failed = True
 
     if inference_failed:
         return 1
 
-    # Cleanup input directories
+    # Cleanup directories
     for input_dir in case_input_dirs:
         if input_dir.exists():
             shutil.rmtree(input_dir)
+    for pred_dirs in pred_dirs_list:
+        for fold_dir in pred_dirs.values():
+            if fold_dir.exists():
+                shutil.rmtree(fold_dir)
 
     # Create submission ZIP
     print(f"\nCreating submission ZIP...")

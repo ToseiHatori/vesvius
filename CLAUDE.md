@@ -167,7 +167,7 @@ kaggle competitions submit \
   -m "説明"
 
 # 提出の監視（必ずnohupで実行すること！）
-nohup python monitor_submission.py --competition vesuvius-challenge-surface-detection > logs/monitor_v<version>.log 2>&1 &
+nohup ~/.local/share/pipx/venvs/kaggle/bin/python monitor_submission.py --competition vesuvius-challenge-surface-detection > logs/monitor_v<version>.log 2>&1 &
 ```
 
 ### 重要: 提出時の必須手順

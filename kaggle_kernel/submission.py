@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from queue import Queue
 
 # =============================================================================
@@ -254,6 +255,32 @@ def prepare_input_images(input_images: list, output_dir: Path) -> list:
 
     return case_ids
 
+
+def prepare_single_case(img_path: Path, case_input_dir: Path) -> str:
+    """Prepare a single case for inference (for pipeline processing).
+
+    Args:
+        img_path: Path to input TIFF image
+        case_input_dir: Directory to prepare input files
+
+    Returns:
+        case_id: The case identifier
+    """
+    case_id = img_path.stem
+
+    # Clean and create input directory
+    if case_input_dir.exists():
+        shutil.rmtree(case_input_dir)
+    case_input_dir.mkdir(parents=True)
+
+    # Prepare input files
+    dest_path = case_input_dir / f"{case_id}_0000.tif"
+    json_path = case_input_dir / f"{case_id}_0000.json"
+    dest_path.symlink_to(img_path.resolve())
+    create_spacing_json(json_path)
+
+    return case_id
+
 # =============================================================================
 # INFERENCE
 # =============================================================================
@@ -468,35 +495,66 @@ def main():
     predictions_tiff_dir = OUTPUT_DIR / "predictions_tiff"
     predictions_tiff_dir.mkdir(parents=True, exist_ok=True)
 
-    # Process each case: run all folds in parallel, then ensemble
-    print(f"\nProcessing cases with parallel inference on {len(FOLDS)} folds...")
-    for i, img_path in enumerate(test_images):
-        case_id = img_path.stem
-        print(f"\n[{i+1}/{len(test_images)}] Processing: {case_id}")
+    # Pipeline processing: overlap preparation and post-processing with inference
+    # Use two input directories alternately to allow parallel preparation
+    print(f"\nProcessing cases with pipelined inference on {len(FOLDS)} folds...")
 
-        # Create temp input directory for this case
-        case_input_dir = OUTPUT_DIR / "case_input"
-        if case_input_dir.exists():
-            shutil.rmtree(case_input_dir)
-        case_input_dir.mkdir(parents=True)
+    case_input_dirs = [OUTPUT_DIR / "case_input_0", OUTPUT_DIR / "case_input_1"]
+    postprocess_futures: list[Future] = []
+    inference_failed = False
 
-        # Prepare single input image
-        dest_path = case_input_dir / f"{case_id}_0000.tif"
-        json_path = case_input_dir / f"{case_id}_0000.json"
-        dest_path.symlink_to(img_path.resolve())
-        create_spacing_json(json_path)
+    # ThreadPoolExecutor for background tasks (preparation + post-processing)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # Prepare first case synchronously
+        first_case_id = prepare_single_case(test_images[0], case_input_dirs[0])
+        prepare_future: Optional[Future] = None
 
-        # Run inference on all folds in parallel
-        success = run_inference_parallel(case_input_dir, pred_dirs)
-        if not success:
-            print(f"ERROR: Inference failed for {case_id}!")
-            return 1
+        for i, img_path in enumerate(test_images):
+            case_id = img_path.stem
+            current_input_dir = case_input_dirs[i % 2]
 
-        # Ensemble predictions and convert to TIFF
-        ensemble_and_convert_to_tiff(pred_dirs, predictions_tiff_dir, case_id)
+            # Wait for preparation if running in background (from previous iteration)
+            if prepare_future is not None:
+                prepare_future.result()
+                prepare_future = None
 
-        # Cleanup temp input
-        shutil.rmtree(case_input_dir)
+            print(f"\n[{i+1}/{len(test_images)}] Processing: {case_id}")
+
+            # Start next case preparation in background (if there is a next case)
+            if i + 1 < len(test_images):
+                next_input_dir = case_input_dirs[(i + 1) % 2]
+                prepare_future = executor.submit(
+                    prepare_single_case, test_images[i + 1], next_input_dir
+                )
+
+            # Run inference on all folds in parallel (GPU-bound)
+            success = run_inference_parallel(current_input_dir, pred_dirs)
+            if not success:
+                print(f"ERROR: Inference failed for {case_id}!")
+                inference_failed = True
+                break
+
+            # Start post-processing in background (CPU-bound: NPZ load, ensemble, hysteresis)
+            postprocess_future = executor.submit(
+                ensemble_and_convert_to_tiff, pred_dirs, predictions_tiff_dir, case_id
+            )
+            postprocess_futures.append((case_id, postprocess_future))
+
+        # Wait for all post-processing to complete
+        print("\nWaiting for post-processing to complete...")
+        for case_id, future in postprocess_futures:
+            result = future.result()
+            if not result:
+                print(f"ERROR: Post-processing failed for {case_id}!")
+                inference_failed = True
+
+    if inference_failed:
+        return 1
+
+    # Cleanup input directories
+    for input_dir in case_input_dirs:
+        if input_dir.exists():
+            shutil.rmtree(input_dir)
 
     # Create submission ZIP
     print(f"\nCreating submission ZIP...")

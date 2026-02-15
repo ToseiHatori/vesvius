@@ -31,6 +31,7 @@ import argparse
 import csv
 import sys
 from pathlib import Path
+from functools import partial
 from multiprocessing import Pool
 from typing import Optional, List, Tuple, Callable
 import numpy as np
@@ -338,6 +339,8 @@ def evaluate_with_postprocess(
     spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     workers: int = 4,
     max_cases: Optional[int] = None,
+    t_low: float = 0.5,
+    t_high: float = 0.9,
 ) -> List[dict]:
     """Evaluate predictions with multiple post-processing methods."""
     from tqdm.auto import tqdm
@@ -355,6 +358,9 @@ def evaluate_with_postprocess(
     args_list = []
     for method_name in postprocess_methods:
         postprocess_fn = POSTPROCESS_METHODS[method_name]
+        # Apply custom t_low/t_high for hysteresis
+        if method_name == "hysteresis":
+            postprocess_fn = partial(postprocess_fn, t_low=t_low, t_high=t_high)
         for case_id in case_ids:
             args_list.append((
                 case_id, npz_dir, gt_dir,
@@ -499,6 +505,14 @@ def main():
         "--output-csv", type=Path, default=None,
         help="Output CSV file path"
     )
+    parser.add_argument(
+        "--t-low", type=float, default=0.5,
+        help="Hysteresis low threshold (default: 0.5)"
+    )
+    parser.add_argument(
+        "--t-high", type=float, default=0.9,
+        help="Hysteresis high threshold (default: 0.9)"
+    )
 
     args = parser.parse_args()
 
@@ -532,6 +546,8 @@ def main():
         spacing=tuple(args.spacing),
         workers=args.workers,
         max_cases=args.max_cases,
+        t_low=args.t_low,
+        t_high=args.t_high,
     )
 
     # Print comparison summary

@@ -38,7 +38,47 @@ python surface-nnunet-preprocessing.py --max-cases 5
 
 前処理済みデータは `nnunet_output/nnUNet_preprocessed/` に保存されます。
 
-### 学習の実行
+### 学習 → 推論 → 評価の一括実行（推奨）
+
+`run-train-and-evaluate.sh` を使用すると、以下を一連で実行できます:
+1. 学習
+2. Validation推論（NPZ/softmax出力）
+3. ポストプロセスなし評価
+4. ヒステリシスポストプロセス評価
+
+```bash
+# nohup で実行（セッションが落ちても継続）
+nohup ./run-train-and-evaluate.sh \
+    --trainer nnUNetTrainer \
+    --plans nnUNetResEncUNetMPlans \
+    --config 3d_lowres \
+    --epochs 2000 \
+    --fold 0 \
+    > logs/train_eval_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# Host Baseline の場合
+nohup ./run-train-and-evaluate.sh \
+    --host-baseline \
+    --fold 0 \
+    > logs/train_eval_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# 学習済みモデルがある場合（推論と評価のみ）
+./run-train-and-evaluate.sh \
+    --skip-train \
+    --trainer nnUNetTrainer_2000epochs \
+    --plans nnUNetResEncUNetMPlans \
+    --config 3d_lowres \
+    --fold 0
+
+# NPZ が既にある場合（評価のみ）
+./run-train-and-evaluate.sh \
+    --eval-only \
+    --npz-dir /path/to/validation_npz
+```
+
+結果は `docs/results/eval_{timestamp}_{model}_fold{N}_{none|hysteresis}.csv` に保存されます。
+
+### 学習のみ実行
 
 コンテナ内で以下を実行:
 
@@ -51,9 +91,6 @@ python surface-nnunet-training-local.py --host-baseline --epochs 1000
 
 # 通常の学習
 python surface-nnunet-training-local.py --train --epochs 50
-
-# 推論のみ
-python surface-nnunet-training-local.py --inference
 ```
 
 ### コンテナの管理
@@ -147,29 +184,20 @@ nohup python monitor_submission.py --competition vesuvius-challenge-surface-dete
 docs/
 ├── EXPERIMENTS.md              # 実験結果サマリー（メイン）
 ├── results/                    # 評価結果CSV
-│   ├── fold0_evaluation.csv
-│   ├── fold1_evaluation.csv
-│   └── ...
+│   └── eval_{timestamp}_{model}_fold{N}_{postprocess}.csv
 ├── kaggle_submission_guide.md  # 提出ガイド
-├── submission_history.md       # 提出履歴
-└── postprocess_comparison.md   # 後処理比較分析
+└── submission_history.md       # 提出履歴
 ```
 
-### 評価の実行
+### 評価の個別実行
 
 ```bash
-# Validation TIFの評価（postprocessなし）
-docker-compose exec nnunet python /workspace/evaluate_validation_tif.py \
-  --pred-dir /workspace/nnunet_output/nnUNet_results/<model>/fold_X/validation \
-  --gt-dir /workspace/nnunet_output/nnUNet_preprocessed/Dataset100_VesuviusSurface/gt_segmentations \
-  --workers 8 \
-  --output-csv /workspace/docs/results/<name>.csv
-
-# 後処理付き評価（NPZファイルが必要）
+# NPZファイルを使った評価（後処理比較）
 docker-compose exec nnunet python /workspace/evaluate_metrics.py \
-  --npz-dir <npz_dir> \
-  --gt-dir <gt_dir> \
+  --npz-dir /workspace/nnunet_output/nnUNet_results/<model>/fold_X/validation_npz \
+  --gt-dir /workspace/nnunet_output/nnUNet_preprocessed/Dataset100_VesuviusSurface/gt_segmentations \
   --postprocess all \
+  --workers 24 \
   --output-csv /workspace/docs/results/<name>.csv
 ```
 

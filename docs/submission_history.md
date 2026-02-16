@@ -8,6 +8,9 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 | # | 提出日時 (JST) | 経過時間 | Local CV | LB Score | 概要 |
 |---|---------------|----------|----------|----------|------|
+| 10 | 2026-02-16 17:59 | 5h 17min | - | 0.565 | パイプライン処理 ダブルバッファリング修正 |
+| 9 | 2026-02-16 04:05 | 5h 13min | - | 0.565 | パイプライン処理（バグあり、遅くなった） |
+| 8 | 2026-02-16 02:45 | 4h 10min | - | 0.565 | step_size=0.3 追加 |
 | 7 | 2026-02-15 00:42 | 5h 46min | - | 0.565 | npp=2, nps=2 実験（遅くなった） |
 | 6 | 2026-02-15 12:25 | 5h 10min | - | 0.565 | 3d_fullres fold_all (single model) |
 | 5 | 2026-02-14 04:20 | 4h 56min | - | 0.565 | 2-fold ensemble (fold_0+fold_1), 2xT4 parallel |
@@ -19,6 +22,48 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 ※ Local CV は Leaderboard 計算式 (0.3×TopoScore + 0.35×SurfaceDice + 0.35×VOI) に基づく
 
 ## 詳細
+
+### Submission #10 (2026-02-16)
+
+- **Ref**: 50388506
+- **Kernel**: v35
+- **モデル**: nnUNetTrainer__nnUNetResEncUNetMPlans__3d_lowres fold_0 + fold_1
+- **エポック数**: 1000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Hysteresis thresholding (t_low=0.3, t_high=0.85)
+- **変更点**: パイプライン処理のレースコンディションをダブルバッファリングで修正
+  - `pred_dirs_buf0`, `pred_dirs_buf1` を交互使用
+  - 同じバッファの後処理完了を待ってから次の推論を開始
+- **経過時間**: 317.4 min (5h 17min)
+- **結果**: LB 0.565 (スコア変わらず)
+- **考察**: バグ修正後も速度改善なし。パイプライン処理自体のオーバーヘッドが大きい。
+
+### Submission #9 (2026-02-16)
+
+- **Ref**: 50379541
+- **Kernel**: v31
+- **モデル**: nnUNetTrainer__nnUNetResEncUNetMPlans__3d_lowres fold_0 + fold_1
+- **エポック数**: 1000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Hysteresis thresholding (t_low=0.3, t_high=0.85)
+- **変更点**: パイプライン処理を追加（ThreadPoolExecutor で前処理・後処理を推論と並列化）
+  - **バグあり**: `pred_dirs` が共有されており、後処理中に次の推論が上書きする可能性
+- **経過時間**: 312.8 min (5h 13min)
+- **結果**: LB 0.565 (スコア変わらず、小数点以下は悪化の可能性)
+- **考察**: パイプライン処理を追加したが逆に遅くなった。レースコンディションにより精度も悪化した可能性。
+
+### Submission #8 (2026-02-16)
+
+- **Ref**: 50379312
+- **Kernel**: v30
+- **モデル**: nnUNetTrainer__nnUNetResEncUNetMPlans__3d_lowres fold_0 + fold_1
+- **エポック数**: 1000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Hysteresis thresholding (t_low=0.3, t_high=0.85)
+- **変更点**: step_size=0.3 (70% overlap) を追加
+- **経過時間**: 250.4 min (4h 10min)
+- **結果**: LB 0.565 (スコア変わらず)
+- **考察**: step_size=0.3 でオーバーラップを増やしたがスコア変わらず。この時点では最速。
 
 ### Submission #7 (2026-02-15)
 
@@ -112,6 +157,8 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 - [x] 他の fold での学習・アンサンブル → fold_0 + fold_1 で試したが改善なし
 - [x] 3d_fullres での学習 → fold_all で試したが改善なし (LB 0.565)
+- [x] パイプライン処理による高速化 → 逆に遅くなった、逐次処理が最適
 - [ ] TTA (Test Time Augmentation) の追加
 - [ ] より多くの fold でのアンサンブル (fold_2, fold_3, fold_4)
 - [ ] 異なるモデルアーキテクチャとのアンサンブル
+- [ ] opening_closing 後処理の提出検証

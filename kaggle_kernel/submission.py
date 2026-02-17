@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres, fold_0 + fold_1 ensemble (2x T4 GPU), no TTA, hysteresis post-processing
+nnUNet 3d_lowres, fold_0 + fold_1 ensemble (2x T4 GPU), no TTA, opening+closing post-processing
 """
 
 import os
@@ -114,37 +114,22 @@ def build_anisotropic_struct(z_radius: int, xy_radius: int) -> Optional[np.ndarr
     return struct
 
 
-def postprocess_hysteresis(
-    probs: np.ndarray,
-    t_low: float = 0.3,
-    t_high: float = 0.85,
-    z_radius: int = 1,
-    xy_radius: int = 0,
-    dust_min_size: int = 100
-) -> np.ndarray:
+def postprocess_opening_closing(probs: np.ndarray) -> np.ndarray:
     """
-    Post-processing with hysteresis thresholding.
+    Post-processing with hysteresis + opening + closing.
 
     This method achieved the best validation score in our experiments:
-    - Leaderboard: 0.6010 (vs 0.5690 for argmax)
-    - TopoScore: 0.3224 (vs 0.2436 for argmax)
-
-    Optimized via grid search over fold_0 and fold_1:
-    - t_low=0.3 consistently best across both folds
-    - t_high=0.85 optimal (0.75-0.85 similar performance)
+    - Leaderboard: 0.6080 (vs 0.6010 for hysteresis-only)
+    - TopoScore: 0.3423 (vs 0.3334 for hysteresis-only)
 
     Steps:
-    1. 3D Hysteresis thresholding: propagate from high confidence to low
-    2. Anisotropic morphological closing (Z direction only)
-    3. Dust removal (remove small connected components)
+    1. 3D Hysteresis thresholding (t_high=0.85, t_low=0.30)
+    2. Opening (remove small protrusions/noise)
+    3. Anisotropic closing (fill small holes, z_radius=2, xy_radius=1)
+    4. Dust removal (remove small connected components)
 
     Args:
         probs: Probability array with shape (num_classes, D, H, W)
-        t_low: Low threshold for hysteresis (default: 0.3)
-        t_high: High threshold for hysteresis (default: 0.85)
-        z_radius: Radius in Z direction for closing (default: 1)
-        xy_radius: Radius in XY plane for closing (default: 0)
-        dust_min_size: Minimum size for connected components (default: 100)
 
     Returns:
         Binary prediction array with shape (D, H, W)
@@ -154,8 +139,8 @@ def postprocess_hysteresis(
     surface_prob = probs[1]  # Class 1 = surface
 
     # Step 1: 3D Hysteresis thresholding
-    strong = surface_prob >= t_high
-    weak = surface_prob >= t_low
+    strong = surface_prob >= 0.85
+    weak = surface_prob >= 0.30
 
     if not strong.any():
         return np.zeros(surface_prob.shape, dtype=np.uint8)
@@ -166,15 +151,16 @@ def postprocess_hysteresis(
     if not mask.any():
         return np.zeros(surface_prob.shape, dtype=np.uint8)
 
-    # Step 2: Anisotropic closing
-    if z_radius > 0 or xy_radius > 0:
-        struct_close = build_anisotropic_struct(z_radius, xy_radius)
-        if struct_close is not None:
-            mask = ndi.binary_closing(mask, structure=struct_close)
+    # Step 2: Opening (remove small protrusions)
+    struct_open = ndi.generate_binary_structure(3, 1)
+    mask = ndi.binary_opening(mask, structure=struct_open)
 
-    # Step 3: Dust removal
-    if dust_min_size > 0:
-        mask = remove_small_objects(mask.astype(bool), min_size=dust_min_size)
+    # Step 3: Closing (fill small holes)
+    struct_close = build_anisotropic_struct(2, 1)
+    mask = ndi.binary_closing(mask, structure=struct_close)
+
+    # Step 4: Dust removal
+    mask = remove_small_objects(mask.astype(bool), min_size=100)
 
     return mask.astype(np.uint8)
 
@@ -395,8 +381,8 @@ def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str
         probs_avg = np.mean(probs_list, axis=0)
         del probs_list
 
-        # Hysteresis post-processing on averaged probabilities
-        pred = postprocess_hysteresis(probs_avg)
+        # Opening+closing post-processing on averaged probabilities
+        pred = postprocess_opening_closing(probs_avg)
         del probs_avg
 
         tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
@@ -470,7 +456,7 @@ def main():
     print(f"Config: {CONFIG}, Folds: {', '.join(FOLDS)}")
     print(f"GPUs: {', '.join(f'fold_{f}->GPU{GPU_FOLD_MAP[f]}' for f in FOLDS)}")
     print(f"TTA: {'disabled' if DISABLE_TTA else 'enabled'}")
-    print(f"Post-processing: {'hysteresis' if USE_HYSTERESIS else 'argmax'}")
+    print(f"Post-processing: {'opening+closing' if USE_HYSTERESIS else 'argmax'}")
     print(f"Ensemble: probability averaging")
     print("=" * 60)
 

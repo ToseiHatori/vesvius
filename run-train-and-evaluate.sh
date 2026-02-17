@@ -127,12 +127,43 @@ mkdir -p "${PROJECT_DIR}/logs"
 mkdir -p "${PROJECT_DIR}/docs/results"
 
 # =============================================================================
+# GPU Check Function
+# =============================================================================
+check_gpu() {
+    local task_name="$1"
+    echo "Checking GPU availability for ${task_name}..."
+
+    # Try nvidia-smi inside container
+    if docker-compose -f "${PROJECT_DIR}/docker-compose.yml" exec -T nnunet nvidia-smi > /dev/null 2>&1; then
+        echo "GPU is available."
+        return 0
+    fi
+
+    echo "WARNING: GPU not detected. Restarting container..."
+    docker-compose -f "${PROJECT_DIR}/docker-compose.yml" restart nnunet
+
+    # Wait for container to be ready
+    sleep 10
+
+    # Check again
+    if docker-compose -f "${PROJECT_DIR}/docker-compose.yml" exec -T nnunet nvidia-smi > /dev/null 2>&1; then
+        echo "GPU is now available after restart."
+        return 0
+    fi
+
+    echo "ERROR: GPU still not available after restart. Aborting."
+    exit 1
+}
+
+# =============================================================================
 # Step 1: Training
 # =============================================================================
 if [ "$SKIP_TRAIN" = false ]; then
     echo "=============================================="
     echo "[Step 1/5] Running training..."
     echo "=============================================="
+
+    check_gpu "training"
 
     TRAIN_ARGS="--train --config ${CONFIG} --fold ${FOLD} --trainer ${TRAINER} --plans ${PLANS}"
     if [[ "$EPOCHS" != "" ]]; then
@@ -158,6 +189,8 @@ if [ "$SKIP_INFERENCE" = false ]; then
     echo "=============================================="
     echo "[Step 2/5] Running validation inference (NPZ/softmax)..."
     echo "=============================================="
+
+    check_gpu "inference"
 
     # Get validation input directory from preprocessed data
     PREPROC_DIR="/workspace/nnunet_output/nnUNet_preprocessed/Dataset100_VesuviusSurface"

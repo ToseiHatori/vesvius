@@ -238,6 +238,47 @@ def postprocess_hysteresis(
     return mask.astype(np.uint8)
 
 
+def postprocess_opening_closing(probs: np.ndarray) -> np.ndarray:
+    """
+    Best post-processing: Hysteresis + opening + closing.
+
+    1. Hysteresis thresholding (t_low=0.3, t_high=0.85)
+    2. Opening (remove small protrusions/noise)
+    3. Anisotropic closing (fill gaps, z_radius=2, xy_radius=1)
+    4. Dust removal
+    """
+    from skimage.morphology import remove_small_objects
+
+    surface_prob = probs[1]
+
+    # Step 1: Hysteresis thresholding
+    t_low, t_high = 0.3, 0.85
+    strong = surface_prob >= t_high
+    weak = surface_prob >= t_low
+
+    if not strong.any():
+        return np.zeros(surface_prob.shape, dtype=np.uint8)
+
+    struct_hyst = ndi.generate_binary_structure(3, 3)
+    mask = ndi.binary_propagation(strong, mask=weak, structure=struct_hyst)
+
+    if not mask.any():
+        return np.zeros(surface_prob.shape, dtype=np.uint8)
+
+    # Step 2: Opening (remove small protrusions)
+    struct_open = ndi.generate_binary_structure(3, 1)
+    mask = ndi.binary_opening(mask, structure=struct_open)
+
+    # Step 3: Anisotropic closing (z_radius=2, xy_radius=1)
+    struct_close = build_anisotropic_struct(z_radius=2, xy_radius=1)
+    mask = ndi.binary_closing(mask, structure=struct_close)
+
+    # Step 4: Dust removal
+    mask = remove_small_objects(mask.astype(bool), min_size=100)
+
+    return mask.astype(np.uint8)
+
+
 # Post-processing registry
 POSTPROCESS_METHODS = {
     "none": postprocess_none,
@@ -245,6 +286,7 @@ POSTPROCESS_METHODS = {
     "threshold_075": postprocess_threshold_075,
     "host_baseline": postprocess_host_baseline,
     "hysteresis": postprocess_hysteresis,
+    "opening_closing": postprocess_opening_closing,
 }
 
 

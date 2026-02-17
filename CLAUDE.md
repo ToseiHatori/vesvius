@@ -45,6 +45,7 @@ python surface-nnunet-preprocessing.py --max-cases 5
 2. Validation推論（NPZ/softmax出力）
 3. ポストプロセスなし評価
 4. ヒステリシスポストプロセス評価
+5. Opening/Closingポストプロセス評価（最良）
 
 ```bash
 # nohup で実行（セッションが落ちても継続）
@@ -76,7 +77,7 @@ nohup ./run-train-and-evaluate.sh \
     --npz-dir /path/to/validation_npz
 ```
 
-結果は `docs/results/eval_{timestamp}_{model}_fold{N}_{none|hysteresis}.csv` に保存されます。
+結果は `docs/results/eval_{timestamp}_{model}_fold{N}_{none|hysteresis|opening_closing}.csv` に保存されます。
 
 ### 学習のみ実行
 

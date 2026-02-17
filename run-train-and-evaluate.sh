@@ -3,7 +3,7 @@
 # Vesuvius: Training + Softmax + Evaluation Pipeline
 # =============================================================================
 #
-# 学習 → validation推論（NPZ/softmax） → 評価（none + hysteresis）を一連で実行
+# 学習 → validation推論（NPZ/softmax） → 評価（none + hysteresis + opening_closing）を一連で実行
 #
 # Usage:
 #   # 学習から評価まで一連実行（nohup推奨）
@@ -30,7 +30,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 # Default values
 TRAINER="nnUNetTrainer"
 PLANS="nnUNetResEncUNetMPlans"
-CONFIG="3d_fullres"
+CONFIG="3d_lowres"
 FOLD="0"
 EPOCHS=""
 SKIP_TRAIN=false
@@ -82,7 +82,7 @@ while [[ $# -gt 0 ]]; do
         --host-baseline)
             TRAINER="nnUNetTrainerMedialSurfaceRecall"
             PLANS="nnUNetHostBaselinePlans"
-            CONFIG="3d_fullres"
+            # CONFIGは明示的に --config で指定可能（デフォルトは3d_lowres）
             shift
             ;;
         *)
@@ -92,9 +92,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Build model directory name
-if [[ "$EPOCHS" != "" ]]; then
-    MODEL_NAME="${TRAINER}_${EPOCHS}epochs__${PLANS}__${CONFIG}"
+# Build model directory name (match Python's get_trainer_name logic)
+if [[ "$TRAINER" != "nnUNetTrainer" ]]; then
+    # Custom trainers don't use epoch suffix
+    MODEL_NAME="${TRAINER}__${PLANS}__${CONFIG}"
+elif [[ "$EPOCHS" != "" ]]; then
+    MODEL_NAME="nnUNetTrainer_${EPOCHS}epochs__${PLANS}__${CONFIG}"
 else
     MODEL_NAME="${TRAINER}__${PLANS}__${CONFIG}"
 fi
@@ -128,7 +131,7 @@ mkdir -p "${PROJECT_DIR}/docs/results"
 # =============================================================================
 if [ "$SKIP_TRAIN" = false ]; then
     echo "=============================================="
-    echo "[Step 1/4] Running training..."
+    echo "[Step 1/5] Running training..."
     echo "=============================================="
 
     TRAIN_ARGS="--train --config ${CONFIG} --fold ${FOLD} --trainer ${TRAINER} --plans ${PLANS}"
@@ -143,7 +146,7 @@ if [ "$SKIP_TRAIN" = false ]; then
     echo "Training completed."
 else
     echo "=============================================="
-    echo "[Step 1/4] Skipping training"
+    echo "[Step 1/5] Skipping training"
     echo "=============================================="
 fi
 
@@ -153,7 +156,7 @@ fi
 if [ "$SKIP_INFERENCE" = false ]; then
     echo ""
     echo "=============================================="
-    echo "[Step 2/4] Running validation inference (NPZ/softmax)..."
+    echo "[Step 2/5] Running validation inference (NPZ/softmax)..."
     echo "=============================================="
 
     # Get validation input directory from preprocessed data
@@ -214,7 +217,7 @@ for case_id in val_cases:
 else
     echo ""
     echo "=============================================="
-    echo "[Step 2/4] Skipping inference"
+    echo "[Step 2/5] Skipping inference"
     echo "=============================================="
 fi
 
@@ -223,7 +226,7 @@ fi
 # =============================================================================
 echo ""
 echo "=============================================="
-echo "[Step 3/4] Evaluating without post-processing..."
+echo "[Step 3/5] Evaluating without post-processing..."
 echo "=============================================="
 
 GT_DIR="/workspace/nnunet_output/nnUNet_preprocessed/Dataset100_VesuviusSurface/gt_segmentations"
@@ -245,7 +248,7 @@ echo "Evaluation (none) completed."
 # =============================================================================
 echo ""
 echo "=============================================="
-echo "[Step 4/4] Evaluating with hysteresis post-processing..."
+echo "[Step 4/5] Evaluating with hysteresis post-processing..."
 echo "=============================================="
 
 OUTPUT_HYST="/workspace/docs/results/eval_${TIMESTAMP}_${MODEL_NAME}_fold${FOLD}_hysteresis.csv"
@@ -262,6 +265,27 @@ echo ""
 echo "Evaluation (hysteresis) completed."
 
 # =============================================================================
+# Step 5: Evaluation with opening_closing post-processing (best)
+# =============================================================================
+echo ""
+echo "=============================================="
+echo "[Step 5/5] Evaluating with opening_closing post-processing..."
+echo "=============================================="
+
+OUTPUT_OC="/workspace/docs/results/eval_${TIMESTAMP}_${MODEL_NAME}_fold${FOLD}_opening_closing.csv"
+
+docker-compose -f "${PROJECT_DIR}/docker-compose.yml" exec -T nnunet \
+    python /workspace/evaluate_metrics.py \
+        --npz-dir "${NPZ_DIR}" \
+        --gt-dir "${GT_DIR}" \
+        --postprocess opening_closing \
+        --workers 24 \
+        --output-csv "${OUTPUT_OC}"
+
+echo ""
+echo "Evaluation (opening_closing) completed."
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
@@ -271,6 +295,7 @@ echo "=============================================="
 echo "End time: $(date)"
 echo ""
 echo "Results:"
-echo "  None:       docs/results/eval_${TIMESTAMP}_${MODEL_NAME}_fold${FOLD}_none.csv"
-echo "  Hysteresis: docs/results/eval_${TIMESTAMP}_${MODEL_NAME}_fold${FOLD}_hysteresis.csv"
+echo "  None:           docs/results/eval_${TIMESTAMP}_${MODEL_NAME}_fold${FOLD}_none.csv"
+echo "  Hysteresis:     docs/results/eval_${TIMESTAMP}_${MODEL_NAME}_fold${FOLD}_hysteresis.csv"
+echo "  Opening/Closing: docs/results/eval_${TIMESTAMP}_${MODEL_NAME}_fold${FOLD}_opening_closing.csv"
 echo "=============================================="

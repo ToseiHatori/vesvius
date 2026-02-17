@@ -170,27 +170,27 @@ def postprocess_opening_closing(probs: np.ndarray) -> np.ndarray:
 
 def setup_environment():
     """Set up nnUNet environment variables."""
-    # Kaggle dataset extracts zip contents directly without parent folder
-    # Actual structure: /kaggle/input/vesvius-model-weights/nnUNetTrainer__...
-    # nnUNet expects: {nnUNet_results}/Dataset100_VesuviusSurface/nnUNetTrainer__...
-    # Solution: Create symlink to match expected structure
+    # Kaggle dataset extracts zip contents WITHOUT the parent folder name
+    # Actual structure: /kaggle/input/vesvius-model-weights/fold_0/checkpoint_final.pth
+    # nnUNet expects: {nnUNet_results}/Dataset100_VesuviusSurface/nnUNetTrainer__.../__config/fold_0/...
+    # Solution: Create symlink at the trainer level
 
     # Use working directory for nnUNet_results so we can create symlinks
     results_dir = OUTPUT_DIR / "nnUNet_results"
-    results_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir = results_dir / DATASET_NAME
+    trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{CONFIG}"
 
-    # Create symlink: Dataset100_VesuviusSurface -> actual model location's parent
-    dataset_link = results_dir / DATASET_NAME
-    if not dataset_link.exists():
-        # The actual trainer folder is directly in MODEL_DATASET_DIR
-        dataset_link.symlink_to(MODEL_DATASET_DIR)
+    # Create directory structure and symlink at trainer level
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    if not trainer_dir.exists():
+        trainer_dir.symlink_to(MODEL_DATASET_DIR)
 
     os.environ["nnUNet_raw"] = str(OUTPUT_DIR / "nnUNet_raw")
     os.environ["nnUNet_preprocessed"] = str(OUTPUT_DIR / "nnUNet_preprocessed")
     os.environ["nnUNet_results"] = str(results_dir)
 
     print(f"nnUNet_results: {results_dir}")
-    print(f"Symlink: {dataset_link} -> {MODEL_DATASET_DIR}")
+    print(f"Symlink: {trainer_dir} -> {MODEL_DATASET_DIR}")
 
     # Verify all fold models exist
     model_dirs = {}

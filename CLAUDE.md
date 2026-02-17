@@ -147,6 +147,33 @@ docker system prune
 kaggle datasets version -p <ディレクトリパス> -m "更新メッセージ" --dir-mode zip
 ```
 
+### 注意: Kaggle データセットのパス構造
+
+`--dir-mode zip` でアップロードすると、**トップレベルのディレクトリ名が消えて中身だけが展開される**。
+
+例: ローカルの構造が以下の場合:
+```
+kaggle_upload/
+└── nnUNetTrainer__nnUNetResEncUNetMPlans__3d_lowres/
+    ├── plans.json
+    ├── fold_0/checkpoint_final.pth
+    └── fold_1/checkpoint_final.pth
+```
+
+Kaggle 上では以下のようになる（ディレクトリ名が消える）:
+```
+/kaggle/input/vesvius-model-weights/
+├── plans.json
+├── fold_0/checkpoint_final.pth
+└── fold_1/checkpoint_final.pth
+```
+
+そのため、`submission.py` では **trainer レベルでシンボリックリンクを作成** している:
+```python
+trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{CONFIG}"
+trainer_dir.symlink_to(MODEL_DATASET_DIR)  # fold_0, fold_1 が直接ある場所にリンク
+```
+
 ## Kaggle 提出
 
 詳細な手順は [docs/kaggle_submission_guide.md](docs/kaggle_submission_guide.md) を参照。
@@ -175,6 +202,10 @@ nohup ~/.local/share/pipx/venvs/kaggle/bin/python monitor_submission.py --compet
 **提出後は必ず `monitor_submission.py` を pipx の pythonで、 nohup で実行すること。**
 
 これにより提出の経過時間が `logs/` に記録され、`docs/submission_history.md` の更新に必要な情報が残る。
+
+### 注意: T4 x 2 GPU 環境での提出
+
+Kaggle API で `kaggle kernels push` すると、GPU 設定が **P100 x 1 に固定** されてしまう。T4 x 2 環境で実行するには、Web UI から手動で GPU 設定を変更して submit する必要がある。
 
 ## 実験管理
 

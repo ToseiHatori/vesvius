@@ -92,13 +92,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Build model directory name (match Python's get_trainer_name logic)
+# Build model directory name and inference trainer name (match Python's get_trainer_name logic)
 if [[ "$TRAINER" != "nnUNetTrainer" ]]; then
     # Custom trainers don't use epoch suffix
+    INFERENCE_TRAINER="${TRAINER}"
     MODEL_NAME="${TRAINER}__${PLANS}__${CONFIG}"
 elif [[ "$EPOCHS" != "" ]]; then
+    INFERENCE_TRAINER="nnUNetTrainer_${EPOCHS}epochs"
     MODEL_NAME="nnUNetTrainer_${EPOCHS}epochs__${PLANS}__${CONFIG}"
 else
+    INFERENCE_TRAINER="${TRAINER}"
     MODEL_NAME="${TRAINER}__${PLANS}__${CONFIG}"
 fi
 
@@ -231,14 +234,17 @@ for case_id in val_cases:
     "
 
     # Run inference with save_probabilities
+    # Override nnUNet environment variables to use local paths
     docker-compose -f "${PROJECT_DIR}/docker-compose.yml" exec -T nnunet \
+        env nnUNet_results=/workspace/nnunet_output/nnUNet_results \
+            nnUNet_preprocessed=/workspace/nnunet_output/nnUNet_preprocessed \
         nnUNetv2_predict \
             -d 100 \
             -c ${CONFIG} \
             -f ${FOLD} \
             -i ${VAL_INPUT} \
             -o ${VAL_OUTPUT} \
-            -tr ${TRAINER} \
+            -tr ${INFERENCE_TRAINER} \
             -p ${PLANS} \
             --save_probabilities \
             -npp 1 -nps 1 \

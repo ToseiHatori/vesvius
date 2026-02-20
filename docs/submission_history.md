@@ -8,6 +8,7 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 | # | 提出日時 (JST) | 経過時間 | Local CV | LB Score | 概要 |
 |---|---------------|----------|----------|----------|------|
+| 11 | 2026-02-17 14:18 | 4h 20min | - | **0.568** | 2000ep + opening_closing + fold_0&1 ensemble |
 | 10 | 2026-02-16 17:59 | 5h 17min | - | 0.565 | パイプライン処理 ダブルバッファリング修正 |
 | 9 | 2026-02-16 04:05 | 5h 13min | - | 0.565 | パイプライン処理（バグあり、遅くなった） |
 | 8 | 2026-02-16 02:45 | 4h 10min | - | 0.565 | step_size=0.3 追加 |
@@ -22,6 +23,19 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 ※ Local CV は Leaderboard 計算式 (0.3×TopoScore + 0.35×SurfaceDice + 0.35×VOI) に基づく
 
 ## 詳細
+
+### Submission #11 (2026-02-17)
+
+- **Ref**: 50405194
+- **Kernel**: v41
+- **モデル**: nnUNetTrainer_2000epochs__nnUNetResEncUNetMPlans__3d_lowres fold_0 + fold_1
+- **エポック数**: 2000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Opening/Closing (disk r=1 open → close)
+- **Ensemble**: 確率の平均 (probability averaging)
+- **経過時間**: 259.5 min (4h 20min)
+- **結果**: LB **0.568** (+0.003)
+- **考察**: 2000エポック + opening_closing 後処理の組み合わせでスコア改善。hysteresis (0.565) より opening_closing が効果的。
 
 ### Submission #10 (2026-02-16)
 
@@ -161,4 +175,4 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 - [ ] TTA (Test Time Augmentation) の追加
 - [ ] より多くの fold でのアンサンブル (fold_2, fold_3, fold_4)
 - [ ] 異なるモデルアーキテクチャとのアンサンブル
-- [ ] opening_closing 後処理の提出検証
+- [x] opening_closing 後処理の提出検証 → LB 0.568 (hysteresis 0.565 より +0.003 改善)

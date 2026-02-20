@@ -67,7 +67,7 @@ DATASET_ID = 100
 DATASET_NAME = f"Dataset{DATASET_ID:03d}_VesuviusSurface"
 TRAINER = "nnUNetTrainer"
 PLANS = "nnUNetResEncUNetMPlans"
-CONFIG = "3d_lowres"
+CONFIGS = ["3d_lowres", "3d_fullres"]  # Ensemble across configs
 FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
 
 # GPU configuration for parallel inference
@@ -171,42 +171,46 @@ def postprocess_opening_closing(probs: np.ndarray) -> np.ndarray:
 def setup_environment():
     """Set up nnUNet environment variables."""
     # Kaggle dataset extracts zip contents WITHOUT the parent folder name
-    # Actual structure: /kaggle/input/vesvius-model-weights/fold_0/checkpoint_final.pth
+    # Actual structure: /kaggle/input/vesvius-model-weights/3d_lowres/fold_0/checkpoint_final.pth
     # nnUNet expects: {nnUNet_results}/Dataset100_VesuviusSurface/nnUNetTrainer__.../__config/fold_0/...
-    # Solution: Create symlink at the trainer level
+    # Solution: Create symlink at the trainer level for each config
 
     # Use working directory for nnUNet_results so we can create symlinks
     results_dir = OUTPUT_DIR / "nnUNet_results"
     dataset_dir = results_dir / DATASET_NAME
-    trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{CONFIG}"
-
-    # Create directory structure and symlink at trainer level
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    if not trainer_dir.exists():
-        trainer_dir.symlink_to(MODEL_DATASET_DIR)
 
     os.environ["nnUNet_raw"] = str(OUTPUT_DIR / "nnUNet_raw")
     os.environ["nnUNet_preprocessed"] = str(OUTPUT_DIR / "nnUNet_preprocessed")
     os.environ["nnUNet_results"] = str(results_dir)
 
     print(f"nnUNet_results: {results_dir}")
-    print(f"Symlink: {trainer_dir} -> {MODEL_DATASET_DIR}")
 
-    # Verify all fold models exist
+    # Create symlinks for all configs
+    dataset_dir.mkdir(parents=True, exist_ok=True)
     model_dirs = {}
-    for fold in FOLDS:
-        model_dir = results_dir / DATASET_NAME / f"{TRAINER}__{PLANS}__{CONFIG}" / f"fold_{fold}"
-        checkpoint = model_dir / "checkpoint_final.pth"
 
-        if not checkpoint.exists():
-            print(f"ERROR: Checkpoint not found: {checkpoint}")
-            print(f"Available files in {MODEL_DATASET_DIR}:")
-            for p in MODEL_DATASET_DIR.rglob("*"):
-                print(f"  {p}")
-            sys.exit(1)
+    for config in CONFIGS:
+        trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{config}"
 
-        print(f"Model checkpoint (fold_{fold}): {checkpoint}")
-        model_dirs[fold] = model_dir
+        # New structure: MODEL_DATASET_DIR/3d_lowres/ or MODEL_DATASET_DIR/3d_fullres/
+        if not trainer_dir.exists():
+            trainer_dir.symlink_to(MODEL_DATASET_DIR / config)
+        print(f"Symlink: {trainer_dir} -> {MODEL_DATASET_DIR / config}")
+
+        # Verify all fold models exist for this config
+        for fold in FOLDS:
+            model_dir = trainer_dir / f"fold_{fold}"
+            checkpoint = model_dir / "checkpoint_final.pth"
+
+            if not checkpoint.exists():
+                print(f"ERROR: Checkpoint not found: {checkpoint}")
+                print(f"Available files in {MODEL_DATASET_DIR}:")
+                for p in MODEL_DATASET_DIR.rglob("*"):
+                    print(f"  {p}")
+                sys.exit(1)
+
+            print(f"Model checkpoint ({config}/fold_{fold}): {checkpoint}")
+            model_dirs[(config, fold)] = model_dir
 
     return model_dirs
 
@@ -274,18 +278,19 @@ def prepare_single_case(img_path: Path, case_input_dir: Path) -> str:
 def run_inference_single_case_fold(
     case_input_dir: Path,
     output_dir: Path,
+    config: str,
     fold: str,
     gpu_id: int,
     result_queue: Queue
 ) -> None:
-    """Run nnUNet inference on a single case with a specific fold and GPU.
+    """Run nnUNet inference on a single case with a specific config, fold and GPU.
 
     This function is designed to be run in a thread.
-    Results are put into result_queue as (fold, success, error_msg).
+    Results are put into result_queue as ((config, fold), success, error_msg).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} nnUNetv2_predict -d {DATASET_ID:03d} -c {CONFIG} -f {fold}"
+    cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} nnUNetv2_predict -d {DATASET_ID:03d} -c {config} -f {fold}"
     cmd += f" -i {case_input_dir} -o {output_dir} -p {PLANS} -tr {TRAINER}"
     cmd += " -npp 1 -nps 1 -step_size 0.3 --verbose"
 
@@ -295,64 +300,74 @@ def run_inference_single_case_fold(
     if USE_HYSTERESIS:
         cmd += " --save_probabilities"
 
-    print(f"[GPU {gpu_id}, fold_{fold}] Running: {cmd}")
+    print(f"[GPU {gpu_id}, {config}/fold_{fold}] Running: {cmd}")
 
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
     if result.returncode != 0:
         error_msg = f"STDOUT:\n{result.stdout[-1000:]}\nSTDERR:\n{result.stderr[-1000:]}"
-        result_queue.put((fold, False, error_msg))
+        result_queue.put(((config, fold), False, error_msg))
     else:
-        result_queue.put((fold, True, None))
+        result_queue.put(((config, fold), True, None))
 
 
 def run_inference_parallel(case_input_dir: Path, output_dirs: dict) -> bool:
-    """Run inference on all folds in parallel using multiple GPUs.
+    """Run inference on all configs and folds using multiple GPUs.
+
+    Runs 2 inferences in parallel (one per GPU), iterating through all config/fold combinations.
 
     Args:
         case_input_dir: Directory containing the input case
-        output_dirs: Dict mapping fold -> output directory
+        output_dirs: Dict mapping (config, fold) -> output directory
 
     Returns:
-        True if all folds succeeded, False otherwise
+        True if all inferences succeeded, False otherwise
     """
     result_queue = Queue()
-    threads = []
-
-    for fold in FOLDS:
-        gpu_id = GPU_FOLD_MAP[fold]
-        output_dir = output_dirs[fold]
-
-        t = threading.Thread(
-            target=run_inference_single_case_fold,
-            args=(case_input_dir, output_dir, fold, gpu_id, result_queue)
-        )
-        threads.append(t)
-        t.start()
-
-    # Wait for all threads to complete
-    for t in threads:
-        t.join()
-
-    # Check results
     all_success = True
-    while not result_queue.empty():
-        fold, success, error_msg = result_queue.get()
-        if not success:
-            print(f"[fold_{fold}] Inference FAILED!")
-            print(error_msg)
-            all_success = False
+
+    # Create list of all (config, fold) combinations
+    combinations = [(config, fold) for config in CONFIGS for fold in FOLDS]
+
+    # Process in batches of 2 (one per GPU)
+    for i in range(0, len(combinations), 2):
+        batch = combinations[i:i+2]
+        threads = []
+
+        for idx, (config, fold) in enumerate(batch):
+            gpu_id = idx  # GPU 0 or 1
+            output_dir = output_dirs[(config, fold)]
+
+            t = threading.Thread(
+                target=run_inference_single_case_fold,
+                args=(case_input_dir, output_dir, config, fold, gpu_id, result_queue)
+            )
+            threads.append(t)
+            t.start()
+
+        # Wait for batch to complete
+        for t in threads:
+            t.join()
+
+        # Check results
+        while not result_queue.empty():
+            key, success, error_msg = result_queue.get()
+            if not success:
+                config, fold = key
+                print(f"[{config}/fold_{fold}] Inference FAILED!")
+                print(error_msg)
+                all_success = False
 
     return all_success
 
 
 def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str) -> bool:
-    """Ensemble predictions from multiple folds and convert to TIFF.
+    """Ensemble predictions from multiple configs and folds and convert to TIFF.
 
-    Averages probabilities from all folds before applying hysteresis post-processing.
+    Averages probabilities from all config/fold combinations before applying post-processing.
 
     Args:
-        pred_dirs: Dict mapping fold -> prediction directory
+        pred_dirs: Dict mapping (config, fold) -> prediction directory
         output_dir: Output directory for final TIFF
         case_id: Case identifier
 
@@ -361,15 +376,18 @@ def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # All (config, fold) combinations
+    combinations = [(config, fold) for config in CONFIGS for fold in FOLDS]
+
     if USE_HYSTERESIS:
-        # Load and average probabilities from all folds
+        # Load and average probabilities from all config/fold combinations
         probs_list = []
         npz_paths = []
 
-        for fold in FOLDS:
-            npz_path = pred_dirs[fold] / f"{case_id}.npz"
+        for config, fold in combinations:
+            npz_path = pred_dirs[(config, fold)] / f"{case_id}.npz"
             if not npz_path.exists():
-                print(f"WARNING: NPZ not found for fold_{fold}: {npz_path}")
+                print(f"WARNING: NPZ not found for {config}/fold_{fold}: {npz_path}")
                 return False
 
             data = np.load(npz_path)
@@ -392,17 +410,17 @@ def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str
         for npz_path in npz_paths:
             npz_path.unlink()
 
-        print(f"  Ensembled {len(FOLDS)} folds and converted: {case_id}")
+        print(f"  Ensembled {len(combinations)} predictions ({len(CONFIGS)} configs x {len(FOLDS)} folds): {case_id}")
         return True
     else:
         # Fallback: use argmax on averaged probabilities or majority vote on TIFFs
         preds_list = []
         tif_paths = []
 
-        for fold in FOLDS:
-            tif_path = pred_dirs[fold] / f"{case_id}.tif"
+        for config, fold in combinations:
+            tif_path = pred_dirs[(config, fold)] / f"{case_id}.tif"
             if not tif_path.exists():
-                print(f"WARNING: TIFF not found for fold_{fold}: {tif_path}")
+                print(f"WARNING: TIFF not found for {config}/fold_{fold}: {tif_path}")
                 return False
 
             pred = tifffile.imread(str(tif_path))
@@ -411,7 +429,7 @@ def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str
 
         # Majority vote (for binary: sum > len/2)
         pred_sum = np.sum(preds_list, axis=0)
-        pred = (pred_sum > len(FOLDS) / 2).astype(np.uint8)
+        pred = (pred_sum > len(combinations) / 2).astype(np.uint8)
         del preds_list, pred_sum
 
         tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
@@ -421,7 +439,7 @@ def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str
         for tif_path in tif_paths:
             tif_path.unlink()
 
-        print(f"  Ensembled {len(FOLDS)} folds (majority vote): {case_id}")
+        print(f"  Ensembled {len(combinations)} predictions (majority vote): {case_id}")
         return True
 
 # =============================================================================
@@ -452,12 +470,13 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 
 def main():
     print("=" * 60)
-    print("Vesuvius nnUNet Submission (2-GPU Ensemble)")
-    print(f"Config: {CONFIG}, Folds: {', '.join(FOLDS)}")
-    print(f"GPUs: {', '.join(f'fold_{f}->GPU{GPU_FOLD_MAP[f]}' for f in FOLDS)}")
+    print("Vesuvius nnUNet Submission (Multi-Config Ensemble)")
+    print(f"Configs: {', '.join(CONFIGS)}")
+    print(f"Folds: {', '.join(FOLDS)}")
+    print(f"Total models: {len(CONFIGS) * len(FOLDS)}")
     print(f"TTA: {'disabled' if DISABLE_TTA else 'enabled'}")
     print(f"Post-processing: {'opening+closing' if USE_HYSTERESIS else 'argmax'}")
-    print(f"Ensemble: probability averaging")
+    print(f"Ensemble: probability averaging across all config/fold combinations")
     print("=" * 60)
 
     # Setup environment
@@ -477,9 +496,11 @@ def main():
     pred_dirs_list = []
     for buf_idx in range(2):
         pred_dirs = {}
-        for fold in FOLDS:
-            pred_dirs[fold] = OUTPUT_DIR / f"predictions_fold{fold}_buf{buf_idx}"
-            pred_dirs[fold].mkdir(parents=True, exist_ok=True)
+        for config in CONFIGS:
+            for fold in FOLDS:
+                key = (config, fold)
+                pred_dirs[key] = OUTPUT_DIR / f"predictions_{config}_fold{fold}_buf{buf_idx}"
+                pred_dirs[key].mkdir(parents=True, exist_ok=True)
         pred_dirs_list.append(pred_dirs)
 
     predictions_tiff_dir = OUTPUT_DIR / "predictions_tiff"
@@ -487,7 +508,8 @@ def main():
 
     # Pipeline processing: overlap preparation and post-processing with inference
     # Use double-buffering for both input and output directories
-    print(f"\nProcessing cases with pipelined inference on {len(FOLDS)} folds...")
+    n_models = len(CONFIGS) * len(FOLDS)
+    print(f"\nProcessing cases with pipelined inference on {n_models} models ({len(CONFIGS)} configs x {len(FOLDS)} folds)...")
 
     case_input_dirs = [OUTPUT_DIR / "case_input_0", OUTPUT_DIR / "case_input_1"]
     inference_failed = False

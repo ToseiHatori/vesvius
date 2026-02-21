@@ -20,6 +20,15 @@
 #   # 推論もスキップ（評価のみ）
 #   ./run-train-and-evaluate.sh --eval-only --npz-dir /path/to/npz
 #
+#   # Transfer learning（既存モデルから継続学習）
+#   nohup ./run-train-and-evaluate.sh \
+#       --trainer nnUNetTrainer_1000epochs \
+#       --config 3d_fullres \
+#       --fold 0 \
+#       --pretrained-weights /path/to/checkpoint_final.pth \
+#       --initial-lr 0.001 \
+#       > logs/train_transfer.log 2>&1 &
+#
 # =============================================================================
 
 set -e
@@ -33,6 +42,8 @@ PLANS="nnUNetResEncUNetMPlans"
 CONFIG="3d_lowres"
 FOLD="0"
 EPOCHS=""
+PRETRAINED_WEIGHTS=""
+INITIAL_LR=""
 SKIP_TRAIN=false
 SKIP_INFERENCE=false
 EVAL_ONLY=false
@@ -59,6 +70,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --epochs)
             EPOCHS="$2"
+            shift 2
+            ;;
+        --pretrained-weights)
+            PRETRAINED_WEIGHTS="$2"
+            shift 2
+            ;;
+        --initial-lr)
+            INITIAL_LR="$2"
             shift 2
             ;;
         --skip-train)
@@ -121,6 +140,8 @@ echo "  Plans: ${PLANS}"
 echo "  Config: ${CONFIG}"
 echo "  Fold: ${FOLD}"
 echo "  Epochs: ${EPOCHS:-default}"
+echo "  Pretrained: ${PRETRAINED_WEIGHTS:-none}"
+echo "  Initial LR: ${INITIAL_LR:-default}"
 echo "  Model: ${MODEL_NAME}"
 echo "  NPZ Dir: ${NPZ_DIR}"
 echo ""
@@ -171,6 +192,12 @@ if [ "$SKIP_TRAIN" = false ]; then
     TRAIN_ARGS="--train --config ${CONFIG} --fold ${FOLD} --trainer ${TRAINER} --plans ${PLANS}"
     if [[ "$EPOCHS" != "" ]]; then
         TRAIN_ARGS="${TRAIN_ARGS} --epochs ${EPOCHS}"
+    fi
+    if [[ "$PRETRAINED_WEIGHTS" != "" ]]; then
+        TRAIN_ARGS="${TRAIN_ARGS} --pretrained-weights ${PRETRAINED_WEIGHTS}"
+    fi
+    if [[ "$INITIAL_LR" != "" ]]; then
+        TRAIN_ARGS="${TRAIN_ARGS} --initial-lr ${INITIAL_LR}"
     fi
 
     docker-compose -f "${PROJECT_DIR}/docker-compose.yml" exec -T nnunet \

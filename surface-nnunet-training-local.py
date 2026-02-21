@@ -1972,6 +1972,7 @@ def full_pipeline(
     epochs: Optional[int] = None,
     trainer: str = "nnUNetTrainer",
     continue_training: bool = False,
+    pretrained_weights: Optional[Path] = None,
     num_gpus: Optional[int] = None,
     save_probabilities: bool = True,
     # Post-processing options (Host Baseline)
@@ -2064,6 +2065,7 @@ def full_pipeline(
             epochs=epochs,
             trainer=trainer,
             continue_training=continue_training,
+            pretrained_weights=pretrained_weights,
             num_gpus=num_gpus,
             timeout=timeout,
             seed=seed
@@ -2254,8 +2256,12 @@ Examples:
   # Full pipeline with 2 GPUs
   python surface-nnunet-training-local.py --train --inference --gpus 2
 
-  # Continue training from checkpoint
+  # Continue training from checkpoint (same trainer, same epoch limit)
   python surface-nnunet-training-local.py --train --continue-training
+
+  # Initialize from pretrained weights (new training with reset LR scheduler)
+  python surface-nnunet-training-local.py --train --epochs 4000 --fold 0 \\
+    --pretrained-weights /path/to/checkpoint_final.pth
 
 Debug Mode:
   The --debug flag enables fast verification with minimal data:
@@ -2306,6 +2312,8 @@ Host Baseline:
                         help="Number of GPUs (default: auto-detect)")
     parser.add_argument("--continue-training", action="store_true",
                         help="Continue from last checkpoint")
+    parser.add_argument("--pretrained-weights", type=str, default=None,
+                        help="Path to pretrained weights (.pth) to initialize from")
 
     # Post-processing options (Host Baseline)
     parser.add_argument("--postprocess", action="store_true",
@@ -2355,6 +2363,9 @@ Host Baseline:
         if fold.isdigit():
             fold = int(fold)
 
+        # Convert pretrained_weights to Path if provided
+        pretrained_weights = Path(args.pretrained_weights) if args.pretrained_weights else None
+
         success = run_host_baseline(
             epochs=args.epochs,
             apply_postprocess=True,
@@ -2366,6 +2377,7 @@ Host Baseline:
             fold=fold,
             num_gpus=args.gpus,
             continue_training=args.continue_training,
+            pretrained_weights=pretrained_weights,
             timeout=args.timeout,
             max_cases=args.max_cases,
             seed=args.seed,
@@ -2383,6 +2395,9 @@ Host Baseline:
     if fold.isdigit():
         fold = int(fold)
 
+    # Convert pretrained_weights to Path if provided
+    pretrained_weights = Path(args.pretrained_weights) if args.pretrained_weights else None
+
     success = full_pipeline(
         do_prepare_raw=not args.skip_raw_prep,
         do_train=args.train,
@@ -2393,6 +2408,7 @@ Host Baseline:
         epochs=args.epochs,
         trainer=args.trainer,
         continue_training=args.continue_training,
+        pretrained_weights=pretrained_weights,
         num_gpus=args.gpus,
         apply_postprocess=args.postprocess,
         postprocess_threshold=args.postprocess_threshold,

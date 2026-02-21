@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres + 3d_fullres, fold_0 + fold_1 ensemble (2x T4 GPU), no TTA, opening+closing post-processing
+nnUNet 3d_lowres + 3d_fullres, fold_0 + fold_1 ensemble (2x T4 GPU), TTA enabled, opening+closing post-processing
 
 Optimized with Python API for faster inference:
 - Model loaded once per (config, fold) combination
@@ -76,8 +76,8 @@ CONFIGS = ["3d_lowres", "3d_fullres"]  # Ensemble across configs
 FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
 
 # Inference settings
-DISABLE_TTA = True  # Faster inference (no test-time augmentation)
-TILE_STEP_SIZE = 0.15  # Sliding window step size (0.15 = 85% overlap)
+DISABLE_TTA = False  # Enable TTA (test-time augmentation with 8 mirroring directions)
+TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap, balanced with TTA)
 BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
 
 # Post-processing settings

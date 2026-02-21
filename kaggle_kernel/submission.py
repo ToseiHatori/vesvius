@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres, fold_0 + fold_1 ensemble (2x T4 GPU), no TTA, opening+closing post-processing
+nnUNet 3d_lowres + 3d_fullres, fold_0 + fold_1 ensemble (2x T4 GPU), no TTA, opening+closing post-processing
+
+Optimized with Python API for faster inference:
+- Model loaded once per (config, fold) combination
+- Parallel inference on 2 GPUs
+- Cumulative probability averaging across configs
 """
 
 import os
 import subprocess
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, Future
 from queue import Queue
 
 # =============================================================================
@@ -42,16 +46,17 @@ install_packages()
 # IMPORTS (after installation)
 # =============================================================================
 
-import json
-import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import torch
 import tifffile
 from scipy import ndimage as ndi
+
+# nnUNet Python API
+from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
 # =============================================================================
 # CONFIGURATION
@@ -70,14 +75,12 @@ PLANS = "nnUNetResEncUNetMPlans"
 CONFIGS = ["3d_lowres", "3d_fullres"]  # Ensemble across configs
 FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
 
-# GPU configuration for parallel inference
-GPU_FOLD_MAP = {
-    "0": 0,  # fold_0 -> GPU 0
-    "1": 1,  # fold_1 -> GPU 1
-}
-
 # Inference settings
-DISABLE_TTA = True  # Faster inference
+DISABLE_TTA = True  # Faster inference (no test-time augmentation)
+TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
+BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
+
+# Post-processing settings
 USE_HYSTERESIS = True  # Hysteresis post-processing (validation: 0.5886 vs 0.5690 for argmax)
 
 # =============================================================================
@@ -215,232 +218,224 @@ def setup_environment():
     return model_dirs
 
 # =============================================================================
-# DATA PREPARATION
+# INFERENCE (Python API - optimized)
 # =============================================================================
 
-def create_spacing_json(output_path: Path, spacing: tuple = (1.0, 1.0, 1.0)):
-    """Create JSON sidecar with spacing info for TIFF files."""
-    json_data = {"spacing": list(spacing)}
-    with open(output_path, "w") as f:
-        json.dump(json_data, f)
+class TiffReader:
+    """Simple TIFF reader compatible with nnUNet's image reader interface."""
+
+    @staticmethod
+    def read_images(image_fnames: list) -> tuple:
+        """Read TIFF images and return as numpy array with properties.
+
+        Args:
+            image_fnames: List of TIFF file paths (one per modality)
+
+        Returns:
+            Tuple of (image_array, properties_dict)
+        """
+        images = []
+        for fname in image_fnames:
+            img = tifffile.imread(str(fname))
+            images.append(img)
+
+        # Stack modalities: (C, D, H, W)
+        image_array = np.stack(images, axis=0).astype(np.float32)
+
+        # Properties dict (spacing is isotropic for this dataset)
+        properties = {
+            'spacing': (1.0, 1.0, 1.0),
+        }
+
+        return image_array, properties
 
 
-def prepare_input_images(input_images: list, output_dir: Path) -> list:
-    """Prepare input images for nnUNet inference."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    case_ids = []
-    for img_path in input_images:
-        case_id = img_path.stem
-        dest_path = output_dir / f"{case_id}_0000.tif"
-        json_path = output_dir / f"{case_id}_0000.json"
-
-        # Symlink image
-        if not dest_path.exists():
-            dest_path.symlink_to(img_path.resolve())
-
-        # Create JSON sidecar
-        create_spacing_json(json_path)
-        case_ids.append(case_id)
-
-    return case_ids
-
-
-def prepare_single_case(img_path: Path, case_input_dir: Path) -> str:
-    """Prepare a single case for inference (for pipeline processing).
+def create_predictor(gpu_id: int) -> nnUNetPredictor:
+    """Create an nnUNetPredictor for a specific GPU.
 
     Args:
+        gpu_id: GPU device ID
+
+    Returns:
+        Initialized nnUNetPredictor (model not yet loaded)
+    """
+    predictor = nnUNetPredictor(
+        tile_step_size=TILE_STEP_SIZE,
+        use_gaussian=True,
+        use_mirroring=not DISABLE_TTA,  # TTA = mirroring
+        perform_everything_on_device=True,
+        device=torch.device('cuda', gpu_id),
+        verbose=False,
+        verbose_preprocessing=False,
+        allow_tqdm=True
+    )
+    return predictor
+
+
+def load_model(predictor: nnUNetPredictor, config: str, fold: str) -> None:
+    """Load a trained model into the predictor.
+
+    Args:
+        predictor: nnUNetPredictor instance
+        config: Model configuration (e.g., '3d_lowres')
+        fold: Fold number as string (e.g., '0')
+    """
+    model_folder = Path(os.environ["nnUNet_results"]) / DATASET_NAME / f"{TRAINER}__{PLANS}__{config}"
+    predictor.initialize_from_trained_model_folder(
+        str(model_folder),
+        use_folds=(int(fold),),
+        checkpoint_name='checkpoint_final.pth',
+    )
+    print(f"  Loaded model: {config}/fold_{fold}")
+
+
+def predict_single_case(
+    predictor: nnUNetPredictor,
+    img_path: Path,
+) -> np.ndarray:
+    """Run inference on a single case and return probabilities.
+
+    Args:
+        predictor: Initialized nnUNetPredictor with model loaded
         img_path: Path to input TIFF image
-        case_input_dir: Directory to prepare input files
 
     Returns:
-        case_id: The case identifier
+        Probability array with shape (num_classes, D, H, W)
     """
-    case_id = img_path.stem
+    # Read image
+    image_array, properties = TiffReader.read_images([img_path])
 
-    # Clean and create input directory
-    if case_input_dir.exists():
-        shutil.rmtree(case_input_dir)
-    case_input_dir.mkdir(parents=True)
+    # Run inference with probability output
+    _seg, probs = predictor.predict_single_npy_array(
+        image_array,
+        properties,
+        None,  # segmentation_previous_stage
+        None,  # output_file_truncated
+        True   # save_or_return_probabilities
+    )
 
-    # Prepare input files
-    dest_path = case_input_dir / f"{case_id}_0000.tif"
-    json_path = case_input_dir / f"{case_id}_0000.json"
-    dest_path.symlink_to(img_path.resolve())
-    create_spacing_json(json_path)
+    return probs
 
-    return case_id
 
-# =============================================================================
-# INFERENCE
-# =============================================================================
-
-def run_inference_single_case_fold(
-    case_input_dir: Path,
+def run_inference_batch(
+    batch_images: list,
+    predictors: dict,
     output_dir: Path,
-    config: str,
-    fold: str,
-    gpu_id: int,
-    result_queue: Queue
-) -> None:
-    """Run nnUNet inference on a single case with a specific config, fold and GPU.
+) -> bool:
+    """Run inference on a batch of cases using all configs/folds.
 
-    This function is designed to be run in a thread.
-    Results are put into result_queue as ((config, fold), success, error_msg).
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} nnUNetv2_predict -d {DATASET_ID:03d} -c {config} -f {fold}"
-    cmd += f" -i {case_input_dir} -o {output_dir} -p {PLANS} -tr {TRAINER}"
-    cmd += " -npp 1 -nps 1 -step_size 0.3 --verbose"
-
-    if DISABLE_TTA:
-        cmd += " --disable_tta"
-
-    if USE_HYSTERESIS:
-        cmd += " --save_probabilities"
-
-    print(f"[GPU {gpu_id}, {config}/fold_{fold}] Running: {cmd}")
-
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-
-    if result.returncode != 0:
-        error_msg = f"STDOUT:\n{result.stdout[-1000:]}\nSTDERR:\n{result.stderr[-1000:]}"
-        result_queue.put(((config, fold), False, error_msg))
-    else:
-        result_queue.put(((config, fold), True, None))
-
-
-def run_inference_parallel(case_input_dir: Path, output_dirs: dict) -> bool:
-    """Run inference on all configs and folds using multiple GPUs.
-
-    Runs 2 inferences in parallel (one per GPU), iterating through all config/fold combinations.
+    Processes a small batch of cases through all models, then ensembles and saves.
+    This limits disk usage to batch_size * num_configs worth of cumulative probabilities.
 
     Args:
-        case_input_dir: Directory containing the input case
-        output_dirs: Dict mapping (config, fold) -> output directory
-
-    Returns:
-        True if all inferences succeeded, False otherwise
-    """
-    result_queue = Queue()
-    all_success = True
-
-    # Create list of all (config, fold) combinations
-    combinations = [(config, fold) for config in CONFIGS for fold in FOLDS]
-
-    # Process in batches of 2 (one per GPU)
-    for i in range(0, len(combinations), 2):
-        batch = combinations[i:i+2]
-        threads = []
-
-        for idx, (config, fold) in enumerate(batch):
-            gpu_id = idx  # GPU 0 or 1
-            output_dir = output_dirs[(config, fold)]
-
-            t = threading.Thread(
-                target=run_inference_single_case_fold,
-                args=(case_input_dir, output_dir, config, fold, gpu_id, result_queue)
-            )
-            threads.append(t)
-            t.start()
-
-        # Wait for batch to complete
-        for t in threads:
-            t.join()
-
-        # Check results
-        while not result_queue.empty():
-            key, success, error_msg = result_queue.get()
-            if not success:
-                config, fold = key
-                print(f"[{config}/fold_{fold}] Inference FAILED!")
-                print(error_msg)
-                all_success = False
-
-    return all_success
-
-
-def ensemble_and_convert_to_tiff(pred_dirs: dict, output_dir: Path, case_id: str) -> bool:
-    """Ensemble predictions from multiple configs and folds and convert to TIFF.
-
-    Averages probabilities from all config/fold combinations before applying post-processing.
-
-    Args:
-        pred_dirs: Dict mapping (config, fold) -> prediction directory
-        output_dir: Output directory for final TIFF
-        case_id: Case identifier
+        batch_images: List of input image paths for this batch
+        predictors: Dict mapping (config, fold) -> nnUNetPredictor (already loaded)
+        output_dir: Output directory for final TIFF files
 
     Returns:
         True if successful, False otherwise
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    n_cases = len(batch_images)
 
-    # All (config, fold) combinations
-    combinations = [(config, fold) for config in CONFIGS for fold in FOLDS]
+    # Store cumulative probabilities in memory for this batch
+    # Key: case_id, Value: cumulative probability sum
+    batch_cumulative = {img.stem: None for img in batch_images}
 
-    if USE_HYSTERESIS:
-        # Load and average probabilities from all config/fold combinations
-        probs_list = []
-        npz_paths = []
+    # Process each config
+    for config in CONFIGS:
+        print(f"  Config: {config}")
 
-        for config, fold in combinations:
-            npz_path = pred_dirs[(config, fold)] / f"{case_id}.npz"
-            if not npz_path.exists():
-                print(f"WARNING: NPZ not found for {config}/fold_{fold}: {npz_path}")
-                return False
+        # Run both folds in parallel
+        result_queues = {fold: Queue() for fold in FOLDS}
+        threads = []
 
-            data = np.load(npz_path)
-            probs_list.append(data['probabilities'])
-            npz_paths.append(npz_path)
-            del data
+        for fold in FOLDS:
+            predictor = predictors[(config, fold)]
 
-        # Average probabilities
-        probs_avg = np.mean(probs_list, axis=0)
-        del probs_list
+            def process_fold(pred, imgs, fold_id, queue):
+                try:
+                    for img_path in imgs:
+                        case_id = img_path.stem
+                        probs = predict_single_case(pred, img_path)
+                        queue.put((case_id, probs, None))
+                except Exception as e:
+                    import traceback
+                    queue.put((None, None, f"{fold_id}: {e}\n{traceback.format_exc()}"))
 
-        # Opening+closing post-processing on averaged probabilities
-        pred = postprocess_opening_closing(probs_avg)
-        del probs_avg
+            t = threading.Thread(
+                target=process_fold,
+                args=(predictor, batch_images, fold, result_queues[fold])
+            )
+            threads.append(t)
+            t.start()
 
+        # Collect results
+        fold_results = {fold: {} for fold in FOLDS}  # fold -> {case_id: probs}
+        errors = []
+
+        for fold in FOLDS:
+            for _ in range(n_cases):
+                case_id, probs, error = result_queues[fold].get()
+                if error:
+                    errors.append(error)
+                else:
+                    fold_results[fold][case_id] = probs
+
+        for t in threads:
+            t.join()
+
+        if errors:
+            for error in errors:
+                print(f"ERROR: {error}")
+            return False
+
+        # Accumulate probabilities for this config
+        for img_path in batch_images:
+            case_id = img_path.stem
+            fold_sum = fold_results[FOLDS[0]][case_id] + fold_results[FOLDS[1]][case_id]
+
+            if batch_cumulative[case_id] is None:
+                batch_cumulative[case_id] = fold_sum
+            else:
+                batch_cumulative[case_id] += fold_sum
+
+        # Free memory for this config's fold results
+        del fold_results
+
+    # Finalize: average and post-process
+    n_models = len(CONFIGS) * len(FOLDS)
+    for img_path in batch_images:
+        case_id = img_path.stem
+        avg_probs = batch_cumulative[case_id] / n_models
+        pred = postprocess_opening_closing(avg_probs)
         tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
-        del pred
+        print(f"    {case_id}: saved")
 
-        # Free disk space - delete all NPZ files
-        for npz_path in npz_paths:
-            npz_path.unlink()
+        # Free memory
+        del batch_cumulative[case_id]
 
-        print(f"  Ensembled {len(combinations)} predictions ({len(CONFIGS)} configs x {len(FOLDS)} folds): {case_id}")
-        return True
-    else:
-        # Fallback: use argmax on averaged probabilities or majority vote on TIFFs
-        preds_list = []
-        tif_paths = []
+    return True
 
-        for config, fold in combinations:
-            tif_path = pred_dirs[(config, fold)] / f"{case_id}.tif"
-            if not tif_path.exists():
-                print(f"WARNING: TIFF not found for {config}/fold_{fold}: {tif_path}")
-                return False
 
-            pred = tifffile.imread(str(tif_path))
-            preds_list.append(pred)
-            tif_paths.append(tif_path)
+def initialize_all_predictors() -> dict:
+    """Initialize predictors for all config/fold combinations.
 
-        # Majority vote (for binary: sum > len/2)
-        pred_sum = np.sum(preds_list, axis=0)
-        pred = (pred_sum > len(combinations) / 2).astype(np.uint8)
-        del preds_list, pred_sum
+    Returns:
+        Dict mapping (config, fold) -> nnUNetPredictor with model loaded
+    """
+    predictors = {}
 
-        tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
-        del pred
+    for config in CONFIGS:
+        for fold in FOLDS:
+            gpu_id = int(fold)  # fold 0 -> GPU 0, fold 1 -> GPU 1
+            print(f"Loading model: {config}/fold_{fold} on GPU {gpu_id}")
 
-        # Free disk space
-        for tif_path in tif_paths:
-            tif_path.unlink()
+            predictor = create_predictor(gpu_id)
+            load_model(predictor, config, fold)
+            predictors[(config, fold)] = predictor
 
-        print(f"  Ensembled {len(combinations)} predictions (majority vote): {case_id}")
-        return True
+    return predictors
+
 
 # =============================================================================
 # SUBMISSION
@@ -470,17 +465,20 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 
 def main():
     print("=" * 60)
-    print("Vesuvius nnUNet Submission (Multi-Config Ensemble)")
+    print("Vesuvius nnUNet Submission (Python API - Optimized)")
     print(f"Configs: {', '.join(CONFIGS)}")
     print(f"Folds: {', '.join(FOLDS)}")
     print(f"Total models: {len(CONFIGS) * len(FOLDS)}")
     print(f"TTA: {'disabled' if DISABLE_TTA else 'enabled'}")
+    print(f"Tile step size: {TILE_STEP_SIZE}")
+    print(f"Batch size: {BATCH_SIZE}")
     print(f"Post-processing: {'opening+closing' if USE_HYSTERESIS else 'argmax'}")
     print(f"Ensemble: probability averaging across all config/fold combinations")
+    print(f"Optimization: Model loaded once per (config, fold), not per case")
     print("=" * 60)
 
     # Setup environment
-    model_dirs = setup_environment()
+    setup_environment()
 
     # Find test images
     test_images_dir = INPUT_DIR / "test_images"
@@ -491,105 +489,36 @@ def main():
         print("ERROR: No test images found!")
         return 1
 
-    # Prepare two sets of directories for double-buffering (avoid race condition)
-    # While post-processing reads from pred_dirs_0, inference writes to pred_dirs_1
-    pred_dirs_list = []
-    for buf_idx in range(2):
-        pred_dirs = {}
-        for config in CONFIGS:
-            for fold in FOLDS:
-                key = (config, fold)
-                pred_dirs[key] = OUTPUT_DIR / f"predictions_{config}_fold{fold}_buf{buf_idx}"
-                pred_dirs[key].mkdir(parents=True, exist_ok=True)
-        pred_dirs_list.append(pred_dirs)
-
+    # Prepare output directory
     predictions_tiff_dir = OUTPUT_DIR / "predictions_tiff"
     predictions_tiff_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pipeline processing: overlap preparation and post-processing with inference
-    # Use double-buffering for both input and output directories
+    # Initialize all predictors (models loaded once)
     n_models = len(CONFIGS) * len(FOLDS)
-    print(f"\nProcessing cases with pipelined inference on {n_models} models ({len(CONFIGS)} configs x {len(FOLDS)} folds)...")
+    print(f"\nLoading {n_models} models...")
+    predictors = initialize_all_predictors()
+    print(f"All models loaded!")
 
-    case_input_dirs = [OUTPUT_DIR / "case_input_0", OUTPUT_DIR / "case_input_1"]
-    inference_failed = False
+    # Process in batches
+    n_batches = (len(test_images) + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"\nProcessing {len(test_images)} cases in {n_batches} batches of up to {BATCH_SIZE}...")
 
-    # ThreadPoolExecutor for background tasks (preparation + post-processing)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        # Prepare first case synchronously
-        first_case_id = prepare_single_case(test_images[0], case_input_dirs[0])
-        prepare_future: Optional[Future] = None
-        # Track post-processing futures for each buffer separately
-        postprocess_futures: list[Optional[tuple[str, Future]]] = [None, None]
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = min(start_idx + BATCH_SIZE, len(test_images))
+        batch_images = test_images[start_idx:end_idx]
 
-        for i, img_path in enumerate(test_images):
-            case_id = img_path.stem
-            buf_idx = i % 2
-            current_input_dir = case_input_dirs[buf_idx]
-            current_pred_dirs = pred_dirs_list[buf_idx]
+        print(f"\n[Batch {batch_idx + 1}/{n_batches}] Processing {len(batch_images)} cases...")
 
-            # Wait for preparation if running in background (from previous iteration)
-            if prepare_future is not None:
-                prepare_future.result()
-                prepare_future = None
+        success = run_inference_batch(
+            batch_images=batch_images,
+            predictors=predictors,
+            output_dir=predictions_tiff_dir,
+        )
 
-            # Wait for post-processing using the SAME buffer to complete
-            # This ensures we don't overwrite pred_dirs while they're being read
-            if postprocess_futures[buf_idx] is not None:
-                prev_case_id, future = postprocess_futures[buf_idx]
-                result = future.result()
-                if not result:
-                    print(f"ERROR: Post-processing failed for {prev_case_id}!")
-                    inference_failed = True
-                    break
-                postprocess_futures[buf_idx] = None
-
-            print(f"\n[{i+1}/{len(test_images)}] Processing: {case_id}")
-
-            # Start next case preparation in background (if there is a next case)
-            if i + 1 < len(test_images):
-                next_input_dir = case_input_dirs[(i + 1) % 2]
-                prepare_future = executor.submit(
-                    prepare_single_case, test_images[i + 1], next_input_dir
-                )
-
-            # Run inference on all folds in parallel (GPU-bound)
-            success = run_inference_parallel(current_input_dir, current_pred_dirs)
-            if not success:
-                print(f"ERROR: Inference failed for {case_id}!")
-                inference_failed = True
-                break
-
-            # Start post-processing in background (CPU-bound: NPZ load, ensemble, hysteresis)
-            postprocess_futures[buf_idx] = (
-                case_id,
-                executor.submit(
-                    ensemble_and_convert_to_tiff, current_pred_dirs, predictions_tiff_dir, case_id
-                )
-            )
-
-        # Wait for all remaining post-processing to complete
-        if not inference_failed:
-            print("\nWaiting for post-processing to complete...")
-            for buf_idx in range(2):
-                if postprocess_futures[buf_idx] is not None:
-                    prev_case_id, future = postprocess_futures[buf_idx]
-                    result = future.result()
-                    if not result:
-                        print(f"ERROR: Post-processing failed for {prev_case_id}!")
-                        inference_failed = True
-
-    if inference_failed:
-        return 1
-
-    # Cleanup directories
-    for input_dir in case_input_dirs:
-        if input_dir.exists():
-            shutil.rmtree(input_dir)
-    for pred_dirs in pred_dirs_list:
-        for fold_dir in pred_dirs.values():
-            if fold_dir.exists():
-                shutil.rmtree(fold_dir)
+        if not success:
+            print(f"ERROR: Inference failed for batch {batch_idx + 1}!")
+            return 1
 
     # Create submission ZIP
     print(f"\nCreating submission ZIP...")

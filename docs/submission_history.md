@@ -8,6 +8,7 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 | # | 提出日時 (JST) | 経過時間 | Local CV | LB Score | 概要 |
 |---|---------------|----------|----------|----------|------|
+| 15 | 2026-02-21 12:54 | 3h 28min | - | 0.580 | step_size=0.25 (v51, 悪化) |
 | 14 | 2026-02-21 06:48 | 4h 05min | - | **0.582** | Python API + 4モデル (lowres+fullres × fold_0&1) |
 | 13 | 2026-02-21 02:21 | - | - | pending | lowres+fullres ensemble (v45, timeout) |
 | 12 | 2026-02-21 02:06 | - | - | 0.575 | **fullres 2000ep fold_0&1 (v43)** |
@@ -26,6 +27,19 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 ※ Local CV は Leaderboard 計算式 (0.3×TopoScore + 0.35×SurfaceDice + 0.35×VOI) に基づく
 
 ## 詳細
+
+### Submission #15 (2026-02-21) - v51: step_size=0.25
+
+- **Ref**: 50490393
+- **Kernel**: v51
+- **モデル**: nnUNetTrainer_2000epochs (3d_lowres + 3d_fullres) × (fold_0 + fold_1) = 4モデル
+- **エポック数**: 2000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Opening/Closing
+- **変更点**: step_size を 0.3 → 0.25 に変更 (75% overlap)
+- **経過時間**: 207.8 min (3h 28min)
+- **結果**: LB **0.580** (-0.002)
+- **考察**: step_size を小さくしてオーバーラップを増やしたが、スコアは悪化。推論時間も短くなったが、これは早期終了した可能性あり。v47 (step_size=0.3) が最適。
 
 ### Submission #14 (2026-02-21) - v47: Best Score
 
@@ -211,6 +225,7 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 - [x] パイプライン処理による高速化 → 逆に遅くなった、逐次処理が最適
 - [x] opening_closing 後処理の提出検証 → LB 0.568 (hysteresis 0.565 より +0.003 改善)
 - [x] **Python API + 4モデルアンサンブル** → LB **0.582** (+0.014 大幅改善！)
+- [x] step_size=0.25 (75% overlap) → LB 0.580 (悪化、0.3が最適)
 - [ ] TTA (Test Time Augmentation) の追加
 - [ ] より多くの fold でのアンサンブル (fold_2, fold_3, fold_4)
 - [ ] 異なるモデルアーキテクチャとのアンサンブル

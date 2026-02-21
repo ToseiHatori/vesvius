@@ -13,7 +13,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 from kaggle.api.kaggle_api_extended import KaggleApi
+
+# リトライ設定
+MAX_RETRIES = 5
+RETRY_BACKOFF_BASE = 30  # 秒
 
 
 def extract_notebook_name(submission) -> str:
@@ -75,11 +80,38 @@ def get_status(submission) -> str:
     return str(status).lower()
 
 
+def fetch_submissions_with_retry(api, competition: str, logger=None):
+    """APIコールをリトライ付きで実行する。"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return api.competition_submissions(competition)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code in (500, 502, 503, 504):
+                wait_time = RETRY_BACKOFF_BASE * (2 ** attempt)
+                msg = f"API error {e.response.status_code}, retrying in {wait_time}s... (attempt {attempt + 1}/{MAX_RETRIES})"
+                if logger:
+                    logger.warning(msg)
+                else:
+                    print(msg)
+                time.sleep(wait_time)
+            else:
+                raise
+        except requests.exceptions.ConnectionError as e:
+            wait_time = RETRY_BACKOFF_BASE * (2 ** attempt)
+            msg = f"Connection error, retrying in {wait_time}s... (attempt {attempt + 1}/{MAX_RETRIES})"
+            if logger:
+                logger.warning(msg)
+            else:
+                print(msg)
+            time.sleep(wait_time)
+    raise RuntimeError(f"Failed to fetch submissions after {MAX_RETRIES} retries")
+
+
 def monitor(competition: str, interval: int, log_dir: str) -> None:
     api = KaggleApi()
     api.authenticate()
 
-    submissions = api.competition_submissions(competition)
+    submissions = fetch_submissions_with_retry(api, competition)
     if not submissions:
         print("No submissions found.")
         return
@@ -95,7 +127,7 @@ def monitor(competition: str, interval: int, log_dir: str) -> None:
     logger.info(f"Submit time: {submit_time}")
 
     while True:
-        submissions = api.competition_submissions(competition)
+        submissions = fetch_submissions_with_retry(api, competition, logger)
         current = next((s for s in submissions if s.ref == ref), None)
         if current is None:
             logger.info(f"Submission ref={ref} not found. Stopping.")

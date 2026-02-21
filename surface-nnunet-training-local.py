@@ -937,6 +937,12 @@ class nnUNetTrainerMedialSurfaceRecall(nnUNetTrainer):
             self.num_epochs = int(epochs_env)
             print(f"Using {self.num_epochs} epochs from NNUNET_EPOCHS environment variable")
 
+        # Read initial_lr from environment variable (for transfer learning)
+        lr_env = os.environ.get("NNUNET_INITIAL_LR")
+        if lr_env is not None:
+            self.initial_lr = float(lr_env)
+            print(f"Using initial_lr={self.initial_lr} from NNUNET_INITIAL_LR environment variable")
+
         # Seed fixing for reproducibility
         seed_env = os.environ.get("NNUNET_SEED")
         if seed_env is not None:
@@ -1290,6 +1296,7 @@ def run_training(
     trainer: str = "nnUNetTrainer",
     pretrained_weights: Optional[Path] = None,
     continue_training: bool = False,
+    initial_lr: Optional[float] = None,
     num_gpus: int = 1,
     timeout: Optional[int] = None,
     seed: Optional[int] = None
@@ -1300,6 +1307,12 @@ def run_training(
     # Set epochs via environment variable for custom trainers
     epochs_to_use = epochs if epochs else 1000
     os.environ["NNUNET_EPOCHS"] = str(epochs_to_use)
+
+    # Set initial_lr via environment variable (for transfer learning)
+    if initial_lr is not None:
+        os.environ["NNUNET_INITIAL_LR"] = str(initial_lr)
+    elif "NNUNET_INITIAL_LR" in os.environ:
+        del os.environ["NNUNET_INITIAL_LR"]  # Clear if not specified
 
     # Set seed via environment variable for reproducibility (default: 42)
     seed_to_use = seed if seed is not None else 42
@@ -1973,6 +1986,7 @@ def full_pipeline(
     trainer: str = "nnUNetTrainer",
     continue_training: bool = False,
     pretrained_weights: Optional[Path] = None,
+    initial_lr: Optional[float] = None,
     num_gpus: Optional[int] = None,
     save_probabilities: bool = True,
     # Post-processing options (Host Baseline)
@@ -2066,6 +2080,7 @@ def full_pipeline(
             trainer=trainer,
             continue_training=continue_training,
             pretrained_weights=pretrained_weights,
+            initial_lr=initial_lr,
             num_gpus=num_gpus,
             timeout=timeout,
             seed=seed
@@ -2259,9 +2274,9 @@ Examples:
   # Continue training from checkpoint (same trainer, same epoch limit)
   python surface-nnunet-training-local.py --train --continue-training
 
-  # Initialize from pretrained weights (new training with reset LR scheduler)
+  # Initialize from pretrained weights (transfer learning with lower LR)
   python surface-nnunet-training-local.py --train --epochs 4000 --fold 0 \\
-    --pretrained-weights /path/to/checkpoint_final.pth
+    --pretrained-weights /path/to/checkpoint_final.pth --initial-lr 0.001
 
 Debug Mode:
   The --debug flag enables fast verification with minimal data:
@@ -2314,6 +2329,8 @@ Host Baseline:
                         help="Continue from last checkpoint")
     parser.add_argument("--pretrained-weights", type=str, default=None,
                         help="Path to pretrained weights (.pth) to initialize from")
+    parser.add_argument("--initial-lr", type=float, default=None,
+                        help="Initial learning rate (default: 0.01, use 0.001 for transfer learning)")
 
     # Post-processing options (Host Baseline)
     parser.add_argument("--postprocess", action="store_true",
@@ -2378,6 +2395,7 @@ Host Baseline:
             num_gpus=args.gpus,
             continue_training=args.continue_training,
             pretrained_weights=pretrained_weights,
+            initial_lr=args.initial_lr,
             timeout=args.timeout,
             max_cases=args.max_cases,
             seed=args.seed,
@@ -2409,6 +2427,7 @@ Host Baseline:
         trainer=args.trainer,
         continue_training=args.continue_training,
         pretrained_weights=pretrained_weights,
+        initial_lr=args.initial_lr,
         num_gpus=args.gpus,
         apply_postprocess=args.postprocess,
         postprocess_threshold=args.postprocess_threshold,

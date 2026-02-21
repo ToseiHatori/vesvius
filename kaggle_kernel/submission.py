@@ -77,7 +77,7 @@ FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
 
 # Inference settings
 DISABLE_TTA = True  # Faster inference (no test-time augmentation)
-TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
+TILE_STEP_SIZE = 0.25  # Sliding window step size (0.25 = 75% overlap)
 BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
 
 # Post-processing settings

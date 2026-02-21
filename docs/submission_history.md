@@ -8,7 +8,10 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 | # | 提出日時 (JST) | 経過時間 | Local CV | LB Score | 概要 |
 |---|---------------|----------|----------|----------|------|
-| 11 | 2026-02-17 14:18 | 4h 20min | - | **0.568** | 2000ep + opening_closing + fold_0&1 ensemble |
+| 14 | 2026-02-21 06:48 | 4h 05min | - | **0.582** | Python API + 4モデル (lowres+fullres × fold_0&1) |
+| 13 | 2026-02-21 02:21 | - | - | pending | lowres+fullres ensemble (v45, timeout) |
+| 12 | 2026-02-21 02:06 | - | - | 0.575 | **fullres 2000ep fold_0&1 (v43)** |
+| 11 | 2026-02-17 14:18 | 4h 20min | - | 0.568 | 2000ep + opening_closing + fold_0&1 ensemble |
 | 10 | 2026-02-16 17:59 | 5h 17min | - | 0.565 | パイプライン処理 ダブルバッファリング修正 |
 | 9 | 2026-02-16 04:05 | 5h 13min | - | 0.565 | パイプライン処理（バグあり、遅くなった） |
 | 8 | 2026-02-16 02:45 | 4h 10min | - | 0.565 | step_size=0.3 追加 |
@@ -23,6 +26,40 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 ※ Local CV は Leaderboard 計算式 (0.3×TopoScore + 0.35×SurfaceDice + 0.35×VOI) に基づく
 
 ## 詳細
+
+### Submission #14 (2026-02-21) - v47: Best Score
+
+- **Ref**: 50484220
+- **Kernel**: v47
+- **モデル**: nnUNetTrainer_2000epochs (3d_lowres + 3d_fullres) × (fold_0 + fold_1) = 4モデル
+- **エポック数**: 2000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Opening/Closing
+- **Ensemble**: 確率の平均 (probability averaging)
+- **経過時間**: 245.1 min (4h 05min)
+- **結果**: LB **0.582** (+0.014)
+- **主な変更点**:
+  - **Python API への移行**: CLI (`nnUNetv2_predict`) から `nnUNetPredictor` Python API へ
+  - **4モデルアンサンブル**: 3d_lowres + 3d_fullres の両方を使用
+  - **バッチ処理**: 5ケースずつ処理してメモリ効率を改善
+  - モデルロード回数: 4回のみ（CLI版は 4 × N_cases 回）
+- **考察**: Python API への移行と 3d_fullres 追加で大幅な精度改善。ローカルベンチマーク（RTX 3090）では 24.86s/case、T4では約4時間で完了。
+
+### Submission #12 (2026-02-21) - v43: fullres 単独
+
+- **Ref**: 50483817
+- **Kernel**: v43
+- **モデル**: 3d_fullres fold_0 + fold_1 (2モデル)
+- **エポック数**: 2000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Opening/Closing
+- **Ensemble**: 確率の平均 (probability averaging)
+- **結果**: LB **0.575** (+0.007 from lowres単独)
+- **考察**:
+  - fullres 2000ep fold_0&1 アンサンブルで LB 0.575
+  - lowres 2000ep (LB 0.568) より +0.007 改善
+  - **重要**: fullres + lowres の4モデル ensemble (v47) で更に +0.007 → LB 0.582
+  - fullres と lowres は異なるスケールの特徴を捉えており、相補効果あり
 
 ### Submission #11 (2026-02-17)
 
@@ -172,7 +209,9 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 - [x] 他の fold での学習・アンサンブル → fold_0 + fold_1 で試したが改善なし
 - [x] 3d_fullres での学習 → fold_all で試したが改善なし (LB 0.565)
 - [x] パイプライン処理による高速化 → 逆に遅くなった、逐次処理が最適
+- [x] opening_closing 後処理の提出検証 → LB 0.568 (hysteresis 0.565 より +0.003 改善)
+- [x] **Python API + 4モデルアンサンブル** → LB **0.582** (+0.014 大幅改善！)
 - [ ] TTA (Test Time Augmentation) の追加
 - [ ] より多くの fold でのアンサンブル (fold_2, fold_3, fold_4)
 - [ ] 異なるモデルアーキテクチャとのアンサンブル
-- [x] opening_closing 後処理の提出検証 → LB 0.568 (hysteresis 0.565 より +0.003 改善)
+- [ ] config-wise モデルローディング（v48で実装済み、メモリ効率改善）

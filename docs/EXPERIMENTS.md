@@ -149,6 +149,10 @@ v47で大幅なスコア改善を達成。
 - fullresの高解像度による改善は見られず
 - ensemble (lowres + fullres) での相補効果に期待
 
+**Kaggle提出結果 (v43)**:
+- 3d_fullres 2000ep fold_0&1 ensemble: **LB 0.575** (+0.007 from lowres単独の 0.568)
+- さらに lowres + fullres の4モデル ensemble (v47): **LB 0.582** (+0.014)
+
 ### 推論並列度 (npp, nps)
 - npp=1, nps=1: 295.9 min
 - npp=2, nps=2: 346.1 min (+50min、遅くなった)

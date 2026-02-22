@@ -76,8 +76,8 @@ CONFIGS = ["3d_lowres", "3d_fullres"]  # Ensemble across configs
 FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
 
 # Inference settings
-DISABLE_TTA = False  # Enable TTA (test-time augmentation with 8 mirroring directions)
-TILE_STEP_SIZE = 0.5  # Sliding window step size (0.5 = 50% overlap, for TTA)
+DISABLE_TTA = True  # Disable TTA for faster inference
+TILE_STEP_SIZE = 0.1  # Sliding window step size (0.1 = 90% overlap, aggressive)
 BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
 
 # Post-processing settings

@@ -8,7 +8,8 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 | # | 提出日時 (JST) | 経過時間 | Local CV | LB Score | 概要 |
 |---|---------------|----------|----------|----------|------|
-| 16 | 2026-02-22 | pending | - | pending | TTA有効 + step_size=0.3 (v56) |
+| 17 | 2026-02-22 17:44 | 6h 45min | - | 0.576 | TTA有効 + step_size=0.5 (v59, 悪化) |
+| 16 | 2026-02-22 | timeout | - | - | TTA有効 + step_size=0.3 (v56, timeout) |
 | 15 | 2026-02-21 12:54 | 3h 28min | - | 0.580 | step_size=0.25 (v51, 悪化) |
 | 14 | 2026-02-21 06:48 | 4h 05min | - | **0.582** | Python API + 4モデル (lowres+fullres × fold_0&1) |
 | 13 | 2026-02-21 02:21 | - | - | pending | lowres+fullres ensemble (v45, timeout) |
@@ -29,7 +30,26 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 ## 詳細
 
-### Submission #16 (2026-02-22) - v56: TTA有効
+### Submission #17 (2026-02-22) - v59: TTA有効 + step_size=0.5
+
+- **Ref**: 50504688
+- **Kernel**: v59
+- **モデル**: nnUNetTrainer_2000epochs (3d_lowres + 3d_fullres) × (fold_0 + fold_1) = 4モデル
+- **エポック数**: 2000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Opening/Closing
+- **変更点**:
+  - **TTA (Test Time Augmentation) 有効化**: 8方向ミラーリングで予測を平均化
+  - **step_size = 0.5** (50% overlap): v56 (step=0.3) がtimeoutしたため拡大
+- **経過時間**: 404.8 min (6h 45min)
+- **結果**: LB **0.576** (-0.006 from best)
+- **考察**:
+  - TTAを有効にしたがスコアは悪化
+  - step_size=0.5は粗すぎて、タイル境界での品質低下が原因と考えられる
+  - TTAの恩恵よりstep_size拡大のデメリットが大きかった
+  - 時間も6h 45minとベスト(4h 05min)より長い
+
+### Submission #16 (2026-02-22) - v56: TTA有効 (timeout)
 
 - **Kernel**: v56
 - **モデル**: nnUNetTrainer_2000epochs (3d_lowres + 3d_fullres) × (fold_0 + fold_1) = 4モデル
@@ -38,12 +58,8 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 - **後処理**: Opening/Closing
 - **変更点**:
   - **TTA (Test Time Augmentation) 有効化**: 8方向ミラーリングで予測を平均化
-  - **step_size = 0.3** (70% overlap): TTAによる計算量増加を相殺
-- **計算量**: 現状 (4モデル, TTA無効, step=0.15) とほぼ同等
-  - 4モデル × 8 (TTA) × 37タイル ≈ 4モデル × 1 × 343タイル
-- **経過時間**: pending
-- **結果**: pending
-- **期待**: TTAによる予測の安定化・精度向上
+  - **step_size = 0.3** (70% overlap)
+- **結果**: **timeout** - 計算量が多すぎた
 
 ### Submission #15 (2026-02-21) - v51: step_size=0.25
 
@@ -243,7 +259,7 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 - [x] opening_closing 後処理の提出検証 → LB 0.568 (hysteresis 0.565 より +0.003 改善)
 - [x] **Python API + 4モデルアンサンブル** → LB **0.582** (+0.014 大幅改善！)
 - [x] step_size=0.25 (75% overlap) → LB 0.580 (悪化、0.3が最適)
-- [ ] TTA (Test Time Augmentation) の追加 → **v56で検証中**
+- [x] TTA (Test Time Augmentation) の追加 → step_size=0.3でtimeout、step_size=0.5でLB 0.576 (悪化)
 - [ ] より多くの fold でのアンサンブル (fold_2, fold_3, fold_4)
 - [ ] 異なるモデルアーキテクチャとのアンサンブル
 - [ ] config-wise モデルローディング（v48で実装済み、メモリ効率改善）

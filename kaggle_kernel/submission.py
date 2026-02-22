@@ -77,7 +77,7 @@ FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
 
 # Inference settings
 DISABLE_TTA = False  # Enable TTA (test-time augmentation with 8 mirroring directions)
-TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap, balanced with TTA)
+TILE_STEP_SIZE = 0.5  # Sliding window step size (0.5 = 50% overlap, for TTA)
 BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
 
 # Post-processing settings

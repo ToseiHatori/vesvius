@@ -8,6 +8,7 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 | # | 提出日時 (JST) | 経過時間 | Local CV | LB Score | 概要 |
 |---|---------------|----------|----------|----------|------|
+| 18 | 2026-02-23 03:00 | 8h 08min | - | 0.578 | step_size=0.2, TTA無効 (v63, 悪化) |
 | 17 | 2026-02-22 17:44 | 6h 45min | - | 0.576 | TTA有効 + step_size=0.5 (v59, 悪化) |
 | 16 | 2026-02-22 | timeout | - | - | TTA有効 + step_size=0.3 (v56, timeout) |
 | 15 | 2026-02-21 12:54 | 3h 28min | - | 0.580 | step_size=0.25 (v51, 悪化) |
@@ -29,6 +30,21 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 ※ Local CV は Leaderboard 計算式 (0.3×TopoScore + 0.35×SurfaceDice + 0.35×VOI) に基づく
 
 ## 詳細
+
+### Submission #18 (2026-02-23) - v63: step_size=0.2
+
+- **Kernel**: v63
+- **モデル**: nnUNetTrainer_2000epochs (3d_lowres + 3d_fullres) × (fold_0 + fold_1) = 4モデル
+- **エポック数**: 2000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Opening/Closing
+- **設定**: step_size=0.2 (80% overlap), TTA無効
+- **経過時間**: 488.4 min (8h 08min)
+- **結果**: LB **0.578** (-0.004 from best)
+- **考察**:
+  - step_size=0.2はベスト(0.3)より細かいがスコア悪化
+  - 時間も8h超と大幅増加（ベスト: 4h 05min）
+  - step_size=0.3が最適（細かすぎても粗すぎても悪化）
 
 ### Submission #17 (2026-02-22) - v59: TTA有効 + step_size=0.5
 
@@ -258,7 +274,7 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 - [x] パイプライン処理による高速化 → 逆に遅くなった、逐次処理が最適
 - [x] opening_closing 後処理の提出検証 → LB 0.568 (hysteresis 0.565 より +0.003 改善)
 - [x] **Python API + 4モデルアンサンブル** → LB **0.582** (+0.014 大幅改善！)
-- [x] step_size=0.25 (75% overlap) → LB 0.580 (悪化、0.3が最適)
+- [x] step_size調整 → 0.3が最適 (0.15: 0.579, 0.2: 0.578, 0.25: 0.580, 0.3: 0.582)
 - [x] TTA (Test Time Augmentation) の追加 → step_size=0.3でtimeout、step_size=0.5でLB 0.576 (悪化)
 - [ ] より多くの fold でのアンサンブル (fold_2, fold_3, fold_4)
 - [ ] 異なるモデルアーキテクチャとのアンサンブル

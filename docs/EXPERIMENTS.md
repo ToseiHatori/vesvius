@@ -14,6 +14,7 @@ Vesuvius Surface Detection の実験結果をまとめたドキュメント。
 | nnUNetResEncUNet | 3d_fullres | all | 1000 | - | 完了、LB 0.565 |
 | nnUNetResEncUNet | 3d_fullres | 0 | 2000 | 0.603 | 完了 |
 | nnUNetResEncUNet | 3d_fullres | 1 | 2000 | 0.603 | 完了 |
+| nnUNetResEncUNet | 3d_fullres | 0 | 4000 | 0.606 | 完了 |
 
 ## 評価結果
 
@@ -152,6 +153,26 @@ v47で大幅なスコア改善を達成。
 **Kaggle提出結果 (v43)**:
 - 3d_fullres 2000ep fold_0&1 ensemble: **LB 0.575** (+0.007 from lowres単独の 0.568)
 - さらに lowres + fullres の4モデル ensemble (v47): **LB 0.582** (+0.014)
+
+### 3d_fullres 4000エポック評価 (2026/02/24)
+
+4000エポックまで学習を延長した 3d_fullres fold_0 の評価結果。
+
+| Postprocess | Leaderboard | TopoScore | SurfaceDice | VOI |
+|-------------|-------------|-----------|-------------|------|
+| none | 0.5764 | 0.2595 | 0.8658 | 0.5593 |
+| hysteresis | 0.5944 | 0.3245 | 0.8584 | 0.5618 |
+| **opening_closing** | **0.6063** | **0.3409** | **0.8758** | **0.5643** |
+
+#### 2000ep → 4000ep 比較 (3d_fullres fold_0, opening_closing)
+
+| Epochs | Leaderboard | TopoScore | SurfaceDice | VOI |
+|--------|-------------|-----------|-------------|------|
+| 2000 | 0.6029 | 0.3327 | 0.8728 | 0.5646 |
+| 4000 | 0.6063 | 0.3409 | 0.8758 | 0.5643 |
+| **差分** | **+0.0034** | **+0.0082** | **+0.0030** | **-0.0003** |
+
+**結論**: 4000エポックで Leaderboard +0.003 の微改善。主にTopoScore (+0.008) とSurfaceDice (+0.003) の向上。VOIはほぼ横ばい。2000ep→4000epの改善幅は1000ep→2000ep (+0.004) と同程度で、過学習の兆候なし。
 
 ### 推論並列度 (npp, nps)
 - npp=1, nps=1: 295.9 min

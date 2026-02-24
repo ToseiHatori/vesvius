@@ -303,7 +303,7 @@ docker-compose -f "${PROJECT_DIR}/docker-compose.yml" exec -T nnunet \
         --npz-dir "${NPZ_DIR}" \
         --gt-dir "${GT_DIR}" \
         --postprocess none \
-        --workers 24 \
+        --workers 48 \
         --output-csv "${OUTPUT_NONE}"
 
 echo ""

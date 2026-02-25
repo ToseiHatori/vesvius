@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres + 3d_fullres, fold_0 + fold_1 ensemble (2x T4 GPU), no TTA, opening+closing post-processing
+nnUNet 3d_lowres + 3d_fullres, fold_0 + fold_1 ensemble (2x T4 GPU), adaptive TTA, opening+closing post-processing
 
 Optimized with Python API for faster inference:
 - Model loaded once per (config, fold) combination
 - Parallel inference on 2 GPUs
 - Cumulative probability averaging across configs
+- Adaptive TTA: uses TTA until time runs low, then switches to no-TTA
 """
 
 import os
 import subprocess
 import sys
 import threading
+import time
 from queue import Queue
 
 # =============================================================================
@@ -48,7 +50,7 @@ install_packages()
 
 import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -76,12 +78,134 @@ CONFIGS = ["3d_lowres", "3d_fullres"]  # Ensemble across configs
 FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
 
 # Inference settings
-DISABLE_TTA = True  # Faster inference (no test-time augmentation)
 TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
 BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
 
+# Adaptive TTA settings
+KAGGLE_TIME_LIMIT_SECONDS = 9 * 60 * 60  # 9 hours
+TTA_SPEEDUP_FACTOR = 8  # TTA is ~8x slower than non-TTA
+SAFETY_MARGIN_SECONDS = 5 * 60  # 5 minutes safety buffer
+
 # Post-processing settings
 USE_HYSTERESIS = True  # Hysteresis post-processing (validation: 0.5886 vs 0.5690 for argmax)
+
+# =============================================================================
+# ADAPTIVE TTA CONTROLLER
+# =============================================================================
+
+class AdaptiveTTAController:
+    """Time-aware TTA controller that switches off TTA when time is running out."""
+
+    def __init__(self, total_cases: int, time_limit: float = KAGGLE_TIME_LIMIT_SECONDS):
+        self.total_cases = total_cases
+        self.time_limit = time_limit
+        self.script_start_time = time.time()
+        self.inference_start_time: Optional[float] = None
+        self.processed_cases = 0
+        self.tta_enabled = True
+        self.tta_disabled_at_case: Optional[int] = None
+        self.case_times: List[float] = []  # Processing time per case (with TTA)
+
+    def mark_inference_start(self) -> None:
+        """Mark the start of inference (after model loading)."""
+        self.inference_start_time = time.time()
+        setup_time = self.inference_start_time - self.script_start_time
+        remaining = self.time_limit - setup_time - SAFETY_MARGIN_SECONDS
+        print(f"[TTA Controller] Setup time: {setup_time:.1f}s")
+        print(f"[TTA Controller] Available inference time: {remaining:.1f}s ({remaining/60:.1f}min)")
+        print(f"[TTA Controller] Total cases: {self.total_cases}")
+
+    def record_case_time(self, elapsed: float) -> None:
+        """Record processing time for a single case."""
+        self.case_times.append(elapsed)
+        self.processed_cases += 1
+
+    def get_avg_case_time(self) -> float:
+        """Get average processing time per case (with TTA)."""
+        if not self.case_times:
+            return 0.0
+        return sum(self.case_times) / len(self.case_times)
+
+    def should_use_tta(self) -> bool:
+        """Determine whether to use TTA based on remaining time and cases."""
+        if self.inference_start_time is None:
+            return True  # Default to TTA before inference starts
+
+        if not self.tta_enabled:
+            return False  # Already switched off
+
+        # Need at least a few samples to estimate
+        if self.processed_cases < 2:
+            return True
+
+        remaining_cases = self.total_cases - self.processed_cases
+        if remaining_cases <= 0:
+            return self.tta_enabled
+
+        elapsed_since_inference = time.time() - self.inference_start_time
+        setup_time = self.inference_start_time - self.script_start_time
+        remaining_time = self.time_limit - setup_time - elapsed_since_inference - SAFETY_MARGIN_SECONDS
+
+        avg_time_with_tta = self.get_avg_case_time()
+        avg_time_without_tta = avg_time_with_tta / TTA_SPEEDUP_FACTOR
+
+        time_needed_with_tta = remaining_cases * avg_time_with_tta
+        time_needed_without_tta = remaining_cases * avg_time_without_tta
+
+        # Key insight: Continue TTA as long as we have margin to switch to no-TTA later
+        # We switch to no-TTA when remaining_time is just enough for no-TTA processing
+        if time_needed_without_tta < remaining_time:
+            # Still have margin - continue with TTA
+            # Log progress periodically
+            if self.processed_cases % 10 == 0:
+                margin = remaining_time - time_needed_without_tta
+                print(f"  [TTA] margin: {margin:.0f}s, can do ~{int(margin / avg_time_with_tta)} more with TTA")
+            return True
+
+        # No more margin - need to switch to no-TTA now
+        self.tta_enabled = False
+        self.tta_disabled_at_case = self.processed_cases
+
+        if time_needed_without_tta <= remaining_time * 1.1:  # Within 10% margin
+            print(f"\n{'='*60}")
+            print(f"[TTA Controller] SWITCHING TTA OFF (optimal timing)")
+            print(f"  Processed: {self.processed_cases}/{self.total_cases} cases")
+            print(f"  Remaining: {remaining_cases} cases")
+            print(f"  Remaining time: {remaining_time:.1f}s ({remaining_time/60:.1f}min)")
+            print(f"  Avg time/case (TTA): {avg_time_with_tta:.1f}s")
+            print(f"  Estimated time/case (no TTA): {avg_time_without_tta:.1f}s")
+            print(f"  Time needed without TTA: {time_needed_without_tta:.1f}s")
+            print(f"{'='*60}\n")
+        else:
+            print(f"\n{'='*60}")
+            print(f"[TTA Controller] WARNING: TIME CRITICAL!")
+            print(f"  Switching to no-TTA but may still be tight!")
+            print(f"  Remaining time: {remaining_time:.1f}s ({remaining_time/60:.1f}min)")
+            print(f"  Time needed (no TTA): {time_needed_without_tta:.1f}s")
+            print(f"  Overage: {time_needed_without_tta - remaining_time:.1f}s")
+            print(f"{'='*60}\n")
+
+        return False
+
+    def print_summary(self) -> None:
+        """Print summary at the end of inference."""
+        if self.inference_start_time is None:
+            return
+
+        total_time = time.time() - self.script_start_time
+        inference_time = time.time() - self.inference_start_time
+
+        print(f"\n[TTA Controller] Summary:")
+        print(f"  Total script time: {total_time:.1f}s ({total_time/60:.1f}min)")
+        print(f"  Inference time: {inference_time:.1f}s ({inference_time/60:.1f}min)")
+        print(f"  Processed cases: {self.processed_cases}")
+        if self.tta_disabled_at_case is not None:
+            print(f"  TTA disabled at case: {self.tta_disabled_at_case}")
+            print(f"  Cases with TTA: {self.tta_disabled_at_case}")
+            print(f"  Cases without TTA: {self.processed_cases - self.tta_disabled_at_case}")
+        else:
+            print(f"  TTA: enabled throughout")
+
 
 # =============================================================================
 # POST-PROCESSING
@@ -250,11 +374,12 @@ class TiffReader:
         return image_array, properties
 
 
-def create_predictor(gpu_id: int) -> nnUNetPredictor:
+def create_predictor(gpu_id: int, use_tta: bool = True) -> nnUNetPredictor:
     """Create an nnUNetPredictor for a specific GPU.
 
     Args:
         gpu_id: GPU device ID
+        use_tta: Whether to enable TTA (test-time augmentation via mirroring)
 
     Returns:
         Initialized nnUNetPredictor (model not yet loaded)
@@ -262,7 +387,7 @@ def create_predictor(gpu_id: int) -> nnUNetPredictor:
     predictor = nnUNetPredictor(
         tile_step_size=TILE_STEP_SIZE,
         use_gaussian=True,
-        use_mirroring=not DISABLE_TTA,  # TTA = mirroring
+        use_mirroring=use_tta,  # TTA = mirroring
         perform_everything_on_device=True,
         device=torch.device('cuda', gpu_id),
         verbose=False,
@@ -321,6 +446,7 @@ def run_inference_batch(
     batch_images: list,
     predictors: dict,
     output_dir: Path,
+    tta_controller: AdaptiveTTAController,
 ) -> bool:
     """Run inference on a batch of cases using all configs/folds.
 
@@ -331,6 +457,7 @@ def run_inference_batch(
         batch_images: List of input image paths for this batch
         predictors: Dict mapping (config, fold) -> nnUNetPredictor (already loaded)
         output_dir: Output directory for final TIFF files
+        tta_controller: Adaptive TTA controller for time-based TTA switching
 
     Returns:
         True if successful, False otherwise
@@ -341,9 +468,23 @@ def run_inference_batch(
     # Key: case_id, Value: cumulative probability sum
     batch_cumulative = {img.stem: None for img in batch_images}
 
+    # Track time per case for TTA controller
+    case_start_times = {img.stem: None for img in batch_images}
+
     # Process each config
     for config in CONFIGS:
-        print(f"  Config: {config}")
+        # Check and update TTA setting before each config
+        use_tta = tta_controller.should_use_tta()
+        for predictor in predictors.values():
+            predictor.use_mirroring = use_tta
+
+        tta_status = "TTA" if use_tta else "no-TTA"
+        print(f"  Config: {config} ({tta_status})")
+
+        # Record start time for first config (before starting threads)
+        if config == CONFIGS[0]:
+            for img in batch_images:
+                case_start_times[img.stem] = time.time()
 
         # Run both folds in parallel
         result_queues = {fold: Queue() for fold in FOLDS}
@@ -409,7 +550,11 @@ def run_inference_batch(
         avg_probs = batch_cumulative[case_id] / n_models
         pred = postprocess_opening_closing(avg_probs)
         tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
-        print(f"    {case_id}: saved")
+
+        # Record case completion time
+        case_elapsed = time.time() - case_start_times[case_id]
+        tta_controller.record_case_time(case_elapsed)
+        print(f"    {case_id}: saved ({case_elapsed:.1f}s)")
 
         # Free memory
         del batch_cumulative[case_id]
@@ -430,7 +575,8 @@ def initialize_all_predictors() -> dict:
             gpu_id = int(fold)  # fold 0 -> GPU 0, fold 1 -> GPU 1
             print(f"Loading model: {config}/fold_{fold} on GPU {gpu_id}")
 
-            predictor = create_predictor(gpu_id)
+            # Start with TTA enabled; AdaptiveTTAController will disable if needed
+            predictor = create_predictor(gpu_id, use_tta=True)
             load_model(predictor, config, fold)
             predictors[(config, fold)] = predictor
 
@@ -465,11 +611,13 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 
 def main():
     print("=" * 60)
-    print("Vesuvius nnUNet Submission (Python API - Optimized)")
+    print("Vesuvius nnUNet Submission (Python API - Adaptive TTA)")
     print(f"Configs: {', '.join(CONFIGS)}")
     print(f"Folds: {', '.join(FOLDS)}")
     print(f"Total models: {len(CONFIGS) * len(FOLDS)}")
-    print(f"TTA: {'disabled' if DISABLE_TTA else 'enabled'}")
+    print(f"TTA: adaptive (will disable if time runs low)")
+    print(f"TTA speedup factor: {TTA_SPEEDUP_FACTOR}x")
+    print(f"Time limit: {KAGGLE_TIME_LIMIT_SECONDS/3600:.1f}h (safety margin: {SAFETY_MARGIN_SECONDS/60:.0f}min)")
     print(f"Tile step size: {TILE_STEP_SIZE}")
     print(f"Batch size: {BATCH_SIZE}")
     print(f"Post-processing: {'opening+closing' if USE_HYSTERESIS else 'argmax'}")
@@ -489,15 +637,21 @@ def main():
         print("ERROR: No test images found!")
         return 1
 
+    # Initialize adaptive TTA controller
+    tta_controller = AdaptiveTTAController(total_cases=len(test_images))
+
     # Prepare output directory
     predictions_tiff_dir = OUTPUT_DIR / "predictions_tiff"
     predictions_tiff_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize all predictors (models loaded once)
+    # Initialize all predictors (models loaded once, TTA enabled by default)
     n_models = len(CONFIGS) * len(FOLDS)
     print(f"\nLoading {n_models} models...")
     predictors = initialize_all_predictors()
     print(f"All models loaded!")
+
+    # Mark inference start (after model loading)
+    tta_controller.mark_inference_start()
 
     # Process in batches
     n_batches = (len(test_images) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -514,11 +668,15 @@ def main():
             batch_images=batch_images,
             predictors=predictors,
             output_dir=predictions_tiff_dir,
+            tta_controller=tta_controller,
         )
 
         if not success:
             print(f"ERROR: Inference failed for batch {batch_idx + 1}!")
             return 1
+
+    # Print TTA controller summary
+    tta_controller.print_summary()
 
     # Create submission ZIP
     print(f"\nCreating submission ZIP...")

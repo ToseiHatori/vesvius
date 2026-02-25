@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres + 3d_fullres, fold_0 + fold_1 ensemble (2x T4 GPU), TTA enabled, opening+closing post-processing
+nnUNet 3d_lowres + 3d_fullres, fold_0 + fold_1 ensemble (2x T4 GPU), no TTA, opening+closing post-processing
 
 Optimized with Python API for faster inference:
 - Model loaded once per (config, fold) combination
@@ -13,8 +13,7 @@ import os
 import subprocess
 import sys
 import threading
-import traceback
-from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
 # =============================================================================
 # INSTALL DEPENDENCIES
@@ -77,7 +76,7 @@ CONFIGS = ["3d_lowres", "3d_fullres"]  # Ensemble across configs
 FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
 
 # Inference settings
-DISABLE_TTA = True  # Disable TTA for faster inference
+DISABLE_TTA = True  # Faster inference (no test-time augmentation)
 TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
 BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
 
@@ -167,26 +166,6 @@ def postprocess_opening_closing(probs: np.ndarray) -> np.ndarray:
     mask = remove_small_objects(mask.astype(bool), min_size=100)
 
     return mask.astype(np.uint8)
-
-
-def postprocess_and_save(avg_probs: np.ndarray, output_dir: Path, case_id: str) -> str:
-    """Run post-processing and save the result.
-
-    This function is designed to be run in a separate thread/process
-    to overlap with GPU inference.
-
-    Args:
-        avg_probs: Averaged probability array with shape (num_classes, D, H, W)
-        output_dir: Output directory for TIFF file
-        case_id: Case identifier for the output filename
-
-    Returns:
-        case_id for logging
-    """
-    pred = postprocess_opening_closing(avg_probs)
-    tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
-    return case_id
-
 
 # =============================================================================
 # ENVIRONMENT SETUP
@@ -345,10 +324,8 @@ def run_inference_batch(
 ) -> bool:
     """Run inference on a batch of cases using all configs/folds.
 
-    Pipelined GPU parallelization:
-    - Each GPU (fold) processes cases and sends results as they complete
-    - Post-processing runs in parallel threads as soon as all folds complete for a case
-    - GPU inference and CPU post-processing overlap for maximum throughput
+    Processes a small batch of cases through all models, then ensembles and saves.
+    This limits disk usage to batch_size * num_configs worth of cumulative probabilities.
 
     Args:
         batch_images: List of input image paths for this batch
@@ -358,97 +335,85 @@ def run_inference_batch(
     Returns:
         True if successful, False otherwise
     """
+    n_cases = len(batch_images)
+
+    # Store cumulative probabilities in memory for this batch
+    # Key: case_id, Value: cumulative probability sum
+    batch_cumulative = {img.stem: None for img in batch_images}
+
+    # Process each config
+    for config in CONFIGS:
+        print(f"  Config: {config}")
+
+        # Run both folds in parallel
+        result_queues = {fold: Queue() for fold in FOLDS}
+        threads = []
+
+        for fold in FOLDS:
+            predictor = predictors[(config, fold)]
+
+            def process_fold(pred, imgs, fold_id, queue):
+                try:
+                    for img_path in imgs:
+                        case_id = img_path.stem
+                        probs = predict_single_case(pred, img_path)
+                        queue.put((case_id, probs, None))
+                except Exception as e:
+                    import traceback
+                    queue.put((None, None, f"{fold_id}: {e}\n{traceback.format_exc()}"))
+
+            t = threading.Thread(
+                target=process_fold,
+                args=(predictor, batch_images, fold, result_queues[fold])
+            )
+            threads.append(t)
+            t.start()
+
+        # Collect results
+        fold_results = {fold: {} for fold in FOLDS}  # fold -> {case_id: probs}
+        errors = []
+
+        for fold in FOLDS:
+            for _ in range(n_cases):
+                case_id, probs, error = result_queues[fold].get()
+                if error:
+                    errors.append(error)
+                else:
+                    fold_results[fold][case_id] = probs
+
+        for t in threads:
+            t.join()
+
+        if errors:
+            for error in errors:
+                print(f"ERROR: {error}")
+            return False
+
+        # Accumulate probabilities for this config
+        for img_path in batch_images:
+            case_id = img_path.stem
+            fold_sum = fold_results[FOLDS[0]][case_id] + fold_results[FOLDS[1]][case_id]
+
+            if batch_cumulative[case_id] is None:
+                batch_cumulative[case_id] = fold_sum
+            else:
+                batch_cumulative[case_id] += fold_sum
+
+        # Free memory for this config's fold results
+        del fold_results
+
+    # Finalize: average and post-process
     n_models = len(CONFIGS) * len(FOLDS)
-
-    # Shared state for collecting results
-    case_results = {}  # case_id -> {fold: probs}
-    case_locks = {img.stem: threading.Lock() for img in batch_images}
-    errors = []
-    errors_lock = threading.Lock()
-
-    # Post-processing executor (runs in parallel with GPU inference)
-    postprocess_executor = ThreadPoolExecutor(max_workers=4)
-    postprocess_futures = []
-    futures_lock = threading.Lock()
-
-    def on_fold_result(case_id: str, fold_id: str, probs: np.ndarray) -> None:
-        """Called when a fold completes inference for a case.
-
-        If all folds are complete for this case, submits post-processing.
-        """
-        with case_locks[case_id]:
-            if case_id not in case_results:
-                case_results[case_id] = {}
-            case_results[case_id][fold_id] = probs
-
-            # Check if all folds are complete for this case
-            if len(case_results[case_id]) == len(FOLDS):
-                # Compute ensemble average
-                total_probs = sum(case_results[case_id].values())
-                avg_probs = total_probs / n_models
-
-                # Release memory for fold results
-                del case_results[case_id]
-
-                # Submit post-processing to run in parallel
-                future = postprocess_executor.submit(
-                    postprocess_and_save, avg_probs, output_dir, case_id
-                )
-                with futures_lock:
-                    postprocess_futures.append(future)
-
-    def process_gpu(fold_id: str, imgs: list) -> None:
-        """Process all cases for a single fold (GPU).
-
-        Processes each case through all configs, then sends result immediately.
-        """
-        try:
-            for img_path in imgs:
-                case_id = img_path.stem
-                cumulative_probs = None
-
-                # Accumulate probabilities across all configs for this case
-                for config in CONFIGS:
-                    predictor = predictors[(config, fold_id)]
-                    probs = predict_single_case(predictor, img_path)
-
-                    if cumulative_probs is None:
-                        cumulative_probs = probs
-                    else:
-                        cumulative_probs += probs
-
-                # Send result immediately (enables pipelining)
-                on_fold_result(case_id, fold_id, cumulative_probs)
-
-        except Exception as e:
-            error_msg = f"fold_{fold_id}: {e}\n{traceback.format_exc()}"
-            with errors_lock:
-                errors.append(error_msg)
-
-    # Start GPU threads
-    threads = []
-    for fold in FOLDS:
-        t = threading.Thread(target=process_gpu, args=(fold, batch_images))
-        threads.append(t)
-        t.start()
-
-    # Wait for all GPU threads to complete
-    for t in threads:
-        t.join()
-
-    # Check for errors
-    if errors:
-        for error in errors:
-            print(f"ERROR: {error}")
-        postprocess_executor.shutdown(wait=False)
-        return False
-
-    # Wait for all post-processing to complete
-    for future in postprocess_futures:
-        case_id = future.result()
+    for img_path in batch_images:
+        case_id = img_path.stem
+        avg_probs = batch_cumulative[case_id] / n_models
+        pred = postprocess_opening_closing(avg_probs)
+        tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
         print(f"    {case_id}: saved")
 
-    postprocess_executor.shutdown(wait=True)
+        # Free memory
+        del batch_cumulative[case_id]
+
     return True
 
 

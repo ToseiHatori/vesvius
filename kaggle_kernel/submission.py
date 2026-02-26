@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres + 3d_fullres weighted ensemble (40:60), fold_0 + fold_1 (2x T4 GPU), no TTA, opening+closing post-processing
+nnUNet 3d_lowres + 3d_fullres weighted ensemble (40:60), fold_0 + fold_1 (2x T4 GPU), opening+closing post-processing
 
 Optimized with Python API for faster inference:
 - Model loaded once per (config, fold) combination
 - Parallel inference on 2 GPUs
 - Weighted ensemble: 40% lowres + 60% fullres (optimized via logloss)
-- TTA disabled for speed
+- TTA: configurable via ENABLE_TTA flag (adaptive or disabled)
 """
 
 import os
@@ -82,7 +82,8 @@ CONFIG_WEIGHTS = {"3d_lowres": 0.4, "3d_fullres": 0.6}  # Optimized via logloss
 TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
 BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
 
-# Adaptive TTA settings
+# TTA settings
+ENABLE_TTA = False  # Set True to enable adaptive TTA, False for no TTA (faster)
 KAGGLE_TIME_LIMIT_SECONDS = 9 * 60 * 60  # 9 hours
 TTA_SPEEDUP_FACTOR = 8  # TTA is ~8x slower than non-TTA
 SAFETY_MARGIN_SECONDS = 5 * 60  # 5 minutes safety buffer
@@ -129,6 +130,10 @@ class AdaptiveTTAController:
 
     def should_use_tta(self) -> bool:
         """Determine whether to use TTA based on remaining time and cases."""
+        # Global TTA disable switch
+        if not ENABLE_TTA:
+            return False
+
         if self.inference_start_time is None:
             return True  # Default to TTA before inference starts
 
@@ -579,8 +584,8 @@ def initialize_all_predictors() -> dict:
             gpu_id = int(fold)  # fold 0 -> GPU 0, fold 1 -> GPU 1
             print(f"Loading model: {config}/fold_{fold} on GPU {gpu_id}")
 
-            # TTA disabled for faster inference
-            predictor = create_predictor(gpu_id, use_tta=False)
+            # TTA setting controlled by ENABLE_TTA flag
+            predictor = create_predictor(gpu_id, use_tta=ENABLE_TTA)
             load_model(predictor, config, fold)
             predictors[(config, fold)] = predictor
 
@@ -615,12 +620,12 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 
 def main():
     print("=" * 60)
-    print("Vesuvius nnUNet Submission (Python API - No TTA)")
+    print("Vesuvius nnUNet Submission (Python API - Weighted Ensemble)")
     print(f"Configs: {', '.join(CONFIGS)}")
     print(f"Folds: {', '.join(FOLDS)}")
     print(f"Total models: {len(CONFIGS) * len(FOLDS)}")
     print(f"Config weights: {CONFIG_WEIGHTS}")
-    print(f"TTA: disabled")
+    print(f"TTA: {'adaptive' if ENABLE_TTA else 'disabled'}")
     print(f"Time limit: {KAGGLE_TIME_LIMIT_SECONDS/3600:.1f}h (safety margin: {SAFETY_MARGIN_SECONDS/60:.0f}min)")
     print(f"Tile step size: {TILE_STEP_SIZE}")
     print(f"Batch size: {BATCH_SIZE}")
@@ -648,7 +653,7 @@ def main():
     predictions_tiff_dir = OUTPUT_DIR / "predictions_tiff"
     predictions_tiff_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize all predictors (models loaded once, TTA enabled by default)
+    # Initialize all predictors (models loaded once)
     n_models = len(CONFIGS) * len(FOLDS)
     print(f"\nLoading {n_models} models...")
     predictors = initialize_all_predictors()

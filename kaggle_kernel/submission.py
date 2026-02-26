@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres + 3d_fullres weighted ensemble (40:60), fold_0 + fold_1 (2x T4 GPU), opening+closing post-processing
+nnUNet weighted ensemble: 3d_fullres/fold_0 (60%) + 3d_lowres/fold_1 (40%), 2x T4 GPU, opening+closing post-processing
 
 Optimized with Python API for faster inference:
 - Model loaded once per (config, fold) combination
 - Parallel inference on 2 GPUs
-- Weighted ensemble: 40% lowres + 60% fullres (optimized via logloss)
+- Weighted ensemble: 60% fullres + 40% lowres (optimized via logloss)
 - TTA: configurable via ENABLE_TTA flag (adaptive or disabled)
 """
 
@@ -74,8 +74,14 @@ DATASET_ID = 100
 DATASET_NAME = f"Dataset{DATASET_ID:03d}_VesuviusSurface"
 TRAINER = "nnUNetTrainer"
 PLANS = "nnUNetResEncUNetMPlans"
-CONFIGS = ["3d_lowres", "3d_fullres"]  # Ensemble across configs
-FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
+
+# Specific config+fold combinations to use
+# Each tuple: (config, fold)
+MODEL_CONFIGS = [
+    ("3d_fullres", "0"),   # 2000epoch fullres fold0
+    ("3d_lowres", "1"),    # 2000epoch lowres fold1
+]
+CONFIGS = list(set(cfg[0] for cfg in MODEL_CONFIGS))  # Unique configs for setup
 CONFIG_WEIGHTS = {"3d_lowres": 0.4, "3d_fullres": 0.6}  # Optimized via logloss
 
 # Inference settings
@@ -318,7 +324,7 @@ def setup_environment():
 
     print(f"nnUNet_results: {results_dir}")
 
-    # Create symlinks for all configs
+    # Create symlinks for configs used in MODEL_CONFIGS
     dataset_dir.mkdir(parents=True, exist_ok=True)
     model_dirs = {}
 
@@ -330,20 +336,21 @@ def setup_environment():
             trainer_dir.symlink_to(MODEL_DATASET_DIR / config)
         print(f"Symlink: {trainer_dir} -> {MODEL_DATASET_DIR / config}")
 
-        # Verify all fold models exist for this config
-        for fold in FOLDS:
-            model_dir = trainer_dir / f"fold_{fold}"
-            checkpoint = model_dir / "checkpoint_final.pth"
+    # Verify only the specific config+fold combinations we're using
+    for config, fold in MODEL_CONFIGS:
+        trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{config}"
+        model_dir = trainer_dir / f"fold_{fold}"
+        checkpoint = model_dir / "checkpoint_final.pth"
 
-            if not checkpoint.exists():
-                print(f"ERROR: Checkpoint not found: {checkpoint}")
-                print(f"Available files in {MODEL_DATASET_DIR}:")
-                for p in MODEL_DATASET_DIR.rglob("*"):
-                    print(f"  {p}")
-                sys.exit(1)
+        if not checkpoint.exists():
+            print(f"ERROR: Checkpoint not found: {checkpoint}")
+            print(f"Available files in {MODEL_DATASET_DIR}:")
+            for p in MODEL_DATASET_DIR.rglob("*"):
+                print(f"  {p}")
+            sys.exit(1)
 
-            print(f"Model checkpoint ({config}/fold_{fold}): {checkpoint}")
-            model_dirs[(config, fold)] = model_dir
+        print(f"Model checkpoint ({config}/fold_{fold}): {checkpoint}")
+        model_dirs[(config, fold)] = model_dir
 
     return model_dirs
 
@@ -454,10 +461,10 @@ def run_inference_batch(
     output_dir: Path,
     tta_controller: AdaptiveTTAController,
 ) -> bool:
-    """Run inference on a batch of cases using all configs/folds.
+    """Run inference on a batch of cases using specified config/fold combinations.
 
-    Processes a small batch of cases through all models, then ensembles and saves.
-    This limits disk usage to batch_size * num_configs worth of cumulative probabilities.
+    Processes a small batch of cases through all models in MODEL_CONFIGS,
+    then ensembles and saves. Models run in parallel across GPUs.
 
     Args:
         batch_images: List of input image paths for this batch
@@ -475,88 +482,81 @@ def run_inference_batch(
     batch_cumulative = {img.stem: None for img in batch_images}
 
     # Track time per case for TTA controller
-    case_start_times = {img.stem: None for img in batch_images}
+    case_start_times = {img.stem: time.time() for img in batch_images}
 
-    # Process each config
-    for config in CONFIGS:
-        # Check and update TTA setting before each config
-        use_tta = tta_controller.should_use_tta()
-        for predictor in predictors.values():
-            predictor.use_mirroring = use_tta
+    # Check and update TTA setting
+    use_tta = tta_controller.should_use_tta()
+    for predictor in predictors.values():
+        predictor.use_mirroring = use_tta
 
-        tta_status = "TTA" if use_tta else "no-TTA"
-        print(f"  Config: {config} ({tta_status})")
+    tta_status = "TTA" if use_tta else "no-TTA"
+    model_desc = ", ".join(f"{cfg}/{fold}" for cfg, fold in MODEL_CONFIGS)
+    print(f"  Models: {model_desc} ({tta_status})")
 
-        # Record start time for first config (before starting threads)
-        if config == CONFIGS[0]:
-            for img in batch_images:
-                case_start_times[img.stem] = time.time()
+    # Run all model configs in parallel
+    result_queues = {(config, fold): Queue() for config, fold in MODEL_CONFIGS}
+    threads = []
 
-        # Run both folds in parallel
-        result_queues = {fold: Queue() for fold in FOLDS}
-        threads = []
+    for config, fold in MODEL_CONFIGS:
+        predictor = predictors[(config, fold)]
 
-        for fold in FOLDS:
-            predictor = predictors[(config, fold)]
+        def process_model(pred, imgs, cfg, fld, queue):
+            try:
+                for img_path in imgs:
+                    case_id = img_path.stem
+                    probs = predict_single_case(pred, img_path)
+                    queue.put((case_id, probs, None))
+            except Exception as e:
+                import traceback
+                queue.put((None, None, f"{cfg}/{fld}: {e}\n{traceback.format_exc()}"))
 
-            def process_fold(pred, imgs, fold_id, queue):
-                try:
-                    for img_path in imgs:
-                        case_id = img_path.stem
-                        probs = predict_single_case(pred, img_path)
-                        queue.put((case_id, probs, None))
-                except Exception as e:
-                    import traceback
-                    queue.put((None, None, f"{fold_id}: {e}\n{traceback.format_exc()}"))
+        t = threading.Thread(
+            target=process_model,
+            args=(predictor, batch_images, config, fold, result_queues[(config, fold)])
+        )
+        threads.append(t)
+        t.start()
 
-            t = threading.Thread(
-                target=process_fold,
-                args=(predictor, batch_images, fold, result_queues[fold])
-            )
-            threads.append(t)
-            t.start()
+    # Collect results
+    model_results = {key: {} for key in MODEL_CONFIGS}  # (config, fold) -> {case_id: probs}
+    errors = []
 
-        # Collect results
-        fold_results = {fold: {} for fold in FOLDS}  # fold -> {case_id: probs}
-        errors = []
-
-        for fold in FOLDS:
-            for _ in range(n_cases):
-                case_id, probs, error = result_queues[fold].get()
-                if error:
-                    errors.append(error)
-                else:
-                    fold_results[fold][case_id] = probs
-
-        for t in threads:
-            t.join()
-
-        if errors:
-            for error in errors:
-                print(f"ERROR: {error}")
-            return False
-
-        # Accumulate weighted probabilities for this config
-        config_weight = CONFIG_WEIGHTS[config]
-        for img_path in batch_images:
-            case_id = img_path.stem
-            fold_sum = fold_results[FOLDS[0]][case_id] + fold_results[FOLDS[1]][case_id]
-            weighted_sum = fold_sum * config_weight
-
-            if batch_cumulative[case_id] is None:
-                batch_cumulative[case_id] = weighted_sum
+    for config, fold in MODEL_CONFIGS:
+        for _ in range(n_cases):
+            case_id, probs, error = result_queues[(config, fold)].get()
+            if error:
+                errors.append(error)
             else:
-                batch_cumulative[case_id] += weighted_sum
+                model_results[(config, fold)][case_id] = probs
 
-        # Free memory for this config's fold results
-        del fold_results
+    for t in threads:
+        t.join()
 
-    # Finalize: average and post-process
-    # Weighted sum already applied, divide by n_folds to average across folds
-    n_folds = len(FOLDS)
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}")
+        return False
+
+    # Accumulate weighted probabilities
     for img_path in batch_images:
         case_id = img_path.stem
-        avg_probs = batch_cumulative[case_id] / n_folds
+        for config, fold in MODEL_CONFIGS:
+            config_weight = CONFIG_WEIGHTS[config]
+            weighted_probs = model_results[(config, fold)][case_id] * config_weight
+
+            if batch_cumulative[case_id] is None:
+                batch_cumulative[case_id] = weighted_probs
+            else:
+                batch_cumulative[case_id] += weighted_probs
+
+    # Free memory for model results
+    del model_results
+
+    # Finalize: post-process (weights already sum to 1.0)
+    for img_path in batch_images:
+        case_id = img_path.stem
+        # Weighted average: 0.6 * fullres + 0.4 * lowres = 1.0 total weight
+        avg_probs = batch_cumulative[case_id]
         pred = postprocess_opening_closing(avg_probs)
         tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
 
@@ -572,22 +572,21 @@ def run_inference_batch(
 
 
 def initialize_all_predictors() -> dict:
-    """Initialize predictors for all config/fold combinations.
+    """Initialize predictors for specific config/fold combinations.
 
     Returns:
         Dict mapping (config, fold) -> nnUNetPredictor with model loaded
     """
     predictors = {}
 
-    for config in CONFIGS:
-        for fold in FOLDS:
-            gpu_id = int(fold)  # fold 0 -> GPU 0, fold 1 -> GPU 1
-            print(f"Loading model: {config}/fold_{fold} on GPU {gpu_id}")
+    for idx, (config, fold) in enumerate(MODEL_CONFIGS):
+        gpu_id = idx % 2  # Distribute across 2 GPUs
+        print(f"Loading model: {config}/fold_{fold} on GPU {gpu_id}")
 
-            # TTA setting controlled by ENABLE_TTA flag
-            predictor = create_predictor(gpu_id, use_tta=ENABLE_TTA)
-            load_model(predictor, config, fold)
-            predictors[(config, fold)] = predictor
+        # TTA setting controlled by ENABLE_TTA flag
+        predictor = create_predictor(gpu_id, use_tta=ENABLE_TTA)
+        load_model(predictor, config, fold)
+        predictors[(config, fold)] = predictor
 
     return predictors
 
@@ -621,9 +620,9 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 def main():
     print("=" * 60)
     print("Vesuvius nnUNet Submission (Python API - Weighted Ensemble)")
-    print(f"Configs: {', '.join(CONFIGS)}")
-    print(f"Folds: {', '.join(FOLDS)}")
-    print(f"Total models: {len(CONFIGS) * len(FOLDS)}")
+    model_desc = ", ".join(f"{cfg}/fold_{fold}" for cfg, fold in MODEL_CONFIGS)
+    print(f"Models: {model_desc}")
+    print(f"Total models: {len(MODEL_CONFIGS)}")
     print(f"Config weights: {CONFIG_WEIGHTS}")
     print(f"TTA: {'adaptive' if ENABLE_TTA else 'disabled'}")
     print(f"Time limit: {KAGGLE_TIME_LIMIT_SECONDS/3600:.1f}h (safety margin: {SAFETY_MARGIN_SECONDS/60:.0f}min)")
@@ -654,7 +653,7 @@ def main():
     predictions_tiff_dir.mkdir(parents=True, exist_ok=True)
 
     # Initialize all predictors (models loaded once)
-    n_models = len(CONFIGS) * len(FOLDS)
+    n_models = len(MODEL_CONFIGS)
     print(f"\nLoading {n_models} models...")
     predictors = initialize_all_predictors()
     print(f"All models loaded!")

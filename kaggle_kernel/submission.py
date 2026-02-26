@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet 3d_lowres + 3d_fullres, fold_0 + fold_1 ensemble (2x T4 GPU), adaptive TTA, opening+closing post-processing
+nnUNet 3d_lowres + 3d_fullres weighted ensemble (40:60), fold_0 + fold_1 (2x T4 GPU), no TTA, opening+closing post-processing
 
 Optimized with Python API for faster inference:
 - Model loaded once per (config, fold) combination
 - Parallel inference on 2 GPUs
-- Cumulative probability averaging across configs
-- Adaptive TTA: uses TTA until time runs low, then switches to no-TTA
+- Weighted ensemble: 40% lowres + 60% fullres (optimized via logloss)
+- TTA disabled for speed
 """
 
 import os
@@ -76,6 +76,7 @@ TRAINER = "nnUNetTrainer"
 PLANS = "nnUNetResEncUNetMPlans"
 CONFIGS = ["3d_lowres", "3d_fullres"]  # Ensemble across configs
 FOLDS = ["0", "1"]  # Ensemble of fold_0 and fold_1
+CONFIG_WEIGHTS = {"3d_lowres": 0.4, "3d_fullres": 0.6}  # Optimized via logloss
 
 # Inference settings
 TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
@@ -530,24 +531,27 @@ def run_inference_batch(
                 print(f"ERROR: {error}")
             return False
 
-        # Accumulate probabilities for this config
+        # Accumulate weighted probabilities for this config
+        config_weight = CONFIG_WEIGHTS[config]
         for img_path in batch_images:
             case_id = img_path.stem
             fold_sum = fold_results[FOLDS[0]][case_id] + fold_results[FOLDS[1]][case_id]
+            weighted_sum = fold_sum * config_weight
 
             if batch_cumulative[case_id] is None:
-                batch_cumulative[case_id] = fold_sum
+                batch_cumulative[case_id] = weighted_sum
             else:
-                batch_cumulative[case_id] += fold_sum
+                batch_cumulative[case_id] += weighted_sum
 
         # Free memory for this config's fold results
         del fold_results
 
     # Finalize: average and post-process
-    n_models = len(CONFIGS) * len(FOLDS)
+    # Weighted sum already applied, divide by n_folds to average across folds
+    n_folds = len(FOLDS)
     for img_path in batch_images:
         case_id = img_path.stem
-        avg_probs = batch_cumulative[case_id] / n_models
+        avg_probs = batch_cumulative[case_id] / n_folds
         pred = postprocess_opening_closing(avg_probs)
         tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
 
@@ -575,8 +579,8 @@ def initialize_all_predictors() -> dict:
             gpu_id = int(fold)  # fold 0 -> GPU 0, fold 1 -> GPU 1
             print(f"Loading model: {config}/fold_{fold} on GPU {gpu_id}")
 
-            # Start with TTA enabled; AdaptiveTTAController will disable if needed
-            predictor = create_predictor(gpu_id, use_tta=True)
+            # TTA disabled for faster inference
+            predictor = create_predictor(gpu_id, use_tta=False)
             load_model(predictor, config, fold)
             predictors[(config, fold)] = predictor
 
@@ -611,17 +615,17 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 
 def main():
     print("=" * 60)
-    print("Vesuvius nnUNet Submission (Python API - Adaptive TTA)")
+    print("Vesuvius nnUNet Submission (Python API - No TTA)")
     print(f"Configs: {', '.join(CONFIGS)}")
     print(f"Folds: {', '.join(FOLDS)}")
     print(f"Total models: {len(CONFIGS) * len(FOLDS)}")
-    print(f"TTA: adaptive (will disable if time runs low)")
-    print(f"TTA speedup factor: {TTA_SPEEDUP_FACTOR}x")
+    print(f"Config weights: {CONFIG_WEIGHTS}")
+    print(f"TTA: disabled")
     print(f"Time limit: {KAGGLE_TIME_LIMIT_SECONDS/3600:.1f}h (safety margin: {SAFETY_MARGIN_SECONDS/60:.0f}min)")
     print(f"Tile step size: {TILE_STEP_SIZE}")
     print(f"Batch size: {BATCH_SIZE}")
     print(f"Post-processing: {'opening+closing' if USE_HYSTERESIS else 'argmax'}")
-    print(f"Ensemble: probability averaging across all config/fold combinations")
+    print(f"Ensemble: weighted probability averaging (40% lowres + 60% fullres)")
     print(f"Optimization: Model loaded once per (config, fold), not per case")
     print("=" * 60)
 

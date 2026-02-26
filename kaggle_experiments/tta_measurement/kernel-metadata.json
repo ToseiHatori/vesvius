@@ -1,0 +1,18 @@
+{
+  "id": "toseihatori/vesvius-tta-speedup-measurement",
+  "title": "Vesvius TTA Speedup Measurement",
+  "code_file": "measure_tta_speedup.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "dataset_sources": [
+    "toseihatori/vesvius-model-weights",
+    "toseihatori/vesvius-nnunet-packages"
+  ],
+  "competition_sources": [
+    "vesuvius-challenge-surface-detection"
+  ],
+  "kernel_sources": []
+}

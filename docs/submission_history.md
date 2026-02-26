@@ -8,6 +8,7 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 
 | # | 提出日時 (JST) | 経過時間 | Local CV | LB Score | 概要 |
 |---|---------------|----------|----------|----------|------|
+| 19 | 2026-02-26 13:49 | 9h 02min | - | 0.581 | Adaptive TTA (v70, 時間ギリギリ完走) |
 | 18 | 2026-02-23 03:00 | 8h 08min | - | 0.578 | step_size=0.2, TTA無効 (v63, 悪化) |
 | 17 | 2026-02-22 17:44 | 6h 45min | - | 0.576 | TTA有効 + step_size=0.5 (v59, 悪化) |
 | 16 | 2026-02-22 | timeout | - | - | TTA有効 + step_size=0.3 (v56, timeout) |
@@ -30,6 +31,27 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 ※ Local CV は Leaderboard 計算式 (0.3×TopoScore + 0.35×SurfaceDice + 0.35×VOI) に基づく
 
 ## 詳細
+
+### Submission #19 (2026-02-26) - v70: Adaptive TTA
+
+- **Kernel**: v70
+- **モデル**: nnUNetTrainer_2000epochs (3d_lowres + 3d_fullres) × (fold_0 + fold_1) = 4モデル
+- **エポック数**: 2000
+- **GPU**: 2x T4 (並列推論)
+- **後処理**: Opening/Closing
+- **変更点**:
+  - **Adaptive TTA**: 時間ベースでTTAの有効/無効を動的に切り替え
+  - スクリプト開始時からの経過時間を監視
+  - 残り時間が不足しそうになったらTTAをオフに切り替え
+  - `TTA_SPEEDUP_FACTOR = 8` (TTA有りは無しの約8倍遅いと仮定)
+  - `SAFETY_MARGIN_SECONDS = 5 * 60` (5分のバッファ)
+- **経過時間**: 542.5 min (9h 02min) - 9時間制限ギリギリ
+- **結果**: LB **0.581** (-0.001 from best)
+- **考察**:
+  - Adaptive TTAにより9時間制限内で完走
+  - ベスト(0.582)にわずかに届かず
+  - TTA_SPEEDUP_FACTOR=8の仮定が実際と異なる可能性あり
+  - 実測ベースでの調整が今後の課題
 
 ### Submission #18 (2026-02-23) - v63: step_size=0.2
 
@@ -276,6 +298,8 @@ Kaggle Vesuvius Challenge Surface Detection コンペティションへの提出
 - [x] **Python API + 4モデルアンサンブル** → LB **0.582** (+0.014 大幅改善！)
 - [x] step_size調整 → 0.3が最適 (0.15: 0.579, 0.2: 0.578, 0.25: 0.580, 0.3: 0.582)
 - [x] TTA (Test Time Augmentation) の追加 → step_size=0.3でtimeout、step_size=0.5でLB 0.576 (悪化)
+- [x] **Adaptive TTA** → 時間ベースでTTA有無を動的切り替え、LB 0.581 (9h 02minでギリギリ完走)
+- [ ] TTA Speedup Factor の実測（現在は8倍と仮定）
 - [ ] より多くの fold でのアンサンブル (fold_2, fold_3, fold_4)
 - [ ] 異なるモデルアーキテクチャとのアンサンブル
 - [ ] config-wise モデルローディング（v48で実装済み、メモリ効率改善）

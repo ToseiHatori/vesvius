@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet weighted ensemble: 4 models (fullres/lowres x fold0/fold1), 2x T4 GPU, opening+closing post-processing
+nnUNet weighted ensemble: 4 models (2000/4000epochs x fullres/lowres), 2x T4 GPU, opening+closing post-processing
 
 Optimized with Python API for faster inference:
-- Model loaded once per (config, fold) combination
+- Model loaded once per (epochs, config, fold) combination
 - Parallel inference on 2 GPUs
-- Weighted ensemble: configurable weights per (config, fold) combination
+- Weighted ensemble: configurable weights per (epochs, config, fold) combination
 - TTA: configurable via ENABLE_TTA flag (adaptive or disabled)
 """
 
@@ -76,19 +76,20 @@ TRAINER = "nnUNetTrainer"
 PLANS = "nnUNetResEncUNetMPlans"
 
 # Model configurations with individual weights
-# Each entry: (config, fold, weight)
+# Each entry: (epochs, config, fold, weight)
 # Weights are normalized automatically if they don't sum to 1.0
 MODEL_CONFIGS = [
-    ("3d_fullres", "0", 0.30),   # 2000epoch fullres fold0
-    ("3d_fullres", "1", 0.30),   # 2000epoch fullres fold1
-    ("3d_lowres", "0", 0.20),    # 2000epoch lowres fold0
-    ("3d_lowres", "1", 0.20),    # 2000epoch lowres fold1
+    ("4000epochs", "3d_fullres", "0", 0.30),   # 4000epoch fullres fold0
+    ("2000epochs", "3d_fullres", "1", 0.30),   # 2000epoch fullres fold1
+    ("2000epochs", "3d_lowres", "0", 0.20),    # 2000epoch lowres fold0
+    ("4000epochs", "3d_lowres", "1", 0.20),    # 4000epoch lowres fold1
 ]
 
 # Normalize weights to sum to 1.0
-_weight_sum = sum(w for _, _, w in MODEL_CONFIGS)
-MODEL_WEIGHTS = {(cfg, fold): w / _weight_sum for cfg, fold, w in MODEL_CONFIGS}
-CONFIGS = list(set(cfg for cfg, _, _ in MODEL_CONFIGS))  # Unique configs for setup
+_weight_sum = sum(w for _, _, _, w in MODEL_CONFIGS)
+MODEL_WEIGHTS = {(epochs, cfg, fold): w / _weight_sum for epochs, cfg, fold, w in MODEL_CONFIGS}
+# Unique (epochs, config) combinations for setup
+EPOCH_CONFIGS = list(set((epochs, cfg) for epochs, cfg, _, _ in MODEL_CONFIGS))
 
 # Inference settings
 TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
@@ -315,10 +316,9 @@ def postprocess_opening_closing(probs: np.ndarray) -> np.ndarray:
 
 def setup_environment():
     """Set up nnUNet environment variables."""
-    # Kaggle dataset extracts zip contents WITHOUT the parent folder name
-    # Actual structure: /kaggle/input/vesvius-model-weights/3d_lowres/fold_0/checkpoint_final.pth
+    # Kaggle dataset structure: /kaggle/input/vesvius-model-weights/2000epochs/3d_lowres/fold_0/checkpoint_final.pth
     # nnUNet expects: {nnUNet_results}/Dataset100_VesuviusSurface/nnUNetTrainer__.../__config/fold_0/...
-    # Solution: Create symlink at the trainer level for each config
+    # Solution: Create symlink at the trainer level for each (epochs, config) combination
 
     # Use working directory for nnUNet_results so we can create symlinks
     results_dir = OUTPUT_DIR / "nnUNet_results"
@@ -330,21 +330,22 @@ def setup_environment():
 
     print(f"nnUNet_results: {results_dir}")
 
-    # Create symlinks for configs used in MODEL_CONFIGS
+    # Create symlinks for (epochs, config) combinations used in MODEL_CONFIGS
     dataset_dir.mkdir(parents=True, exist_ok=True)
     model_dirs = {}
 
-    for config in CONFIGS:
-        trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{config}"
+    for epochs, config in EPOCH_CONFIGS:
+        # Use epochs/config as trainer name to make unique paths
+        trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{epochs}__{config}"
 
-        # New structure: MODEL_DATASET_DIR/3d_lowres/ or MODEL_DATASET_DIR/3d_fullres/
+        # New structure: MODEL_DATASET_DIR/2000epochs/3d_lowres/ etc.
         if not trainer_dir.exists():
-            trainer_dir.symlink_to(MODEL_DATASET_DIR / config)
-        print(f"Symlink: {trainer_dir} -> {MODEL_DATASET_DIR / config}")
+            trainer_dir.symlink_to(MODEL_DATASET_DIR / epochs / config)
+        print(f"Symlink: {trainer_dir} -> {MODEL_DATASET_DIR / epochs / config}")
 
-    # Verify only the specific config+fold combinations we're using
-    for config, fold, _ in MODEL_CONFIGS:
-        trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{config}"
+    # Verify only the specific (epochs, config, fold) combinations we're using
+    for epochs, config, fold, _ in MODEL_CONFIGS:
+        trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{epochs}__{config}"
         model_dir = trainer_dir / f"fold_{fold}"
         checkpoint = model_dir / "checkpoint_final.pth"
 
@@ -355,8 +356,8 @@ def setup_environment():
                 print(f"  {p}")
             sys.exit(1)
 
-        print(f"Model checkpoint ({config}/fold_{fold}): {checkpoint}")
-        model_dirs[(config, fold)] = model_dir
+        print(f"Model checkpoint ({epochs}/{config}/fold_{fold}): {checkpoint}")
+        model_dirs[(epochs, config, fold)] = model_dir
 
     return model_dirs
 
@@ -416,21 +417,22 @@ def create_predictor(gpu_id: int, use_tta: bool = True) -> nnUNetPredictor:
     return predictor
 
 
-def load_model(predictor: nnUNetPredictor, config: str, fold: str) -> None:
+def load_model(predictor: nnUNetPredictor, epochs: str, config: str, fold: str) -> None:
     """Load a trained model into the predictor.
 
     Args:
         predictor: nnUNetPredictor instance
+        epochs: Epochs identifier (e.g., '2000epochs', '4000epochs')
         config: Model configuration (e.g., '3d_lowres')
         fold: Fold number as string (e.g., '0')
     """
-    model_folder = Path(os.environ["nnUNet_results"]) / DATASET_NAME / f"{TRAINER}__{PLANS}__{config}"
+    model_folder = Path(os.environ["nnUNet_results"]) / DATASET_NAME / f"{TRAINER}__{PLANS}__{epochs}__{config}"
     predictor.initialize_from_trained_model_folder(
         str(model_folder),
         use_folds=(int(fold),),
         checkpoint_name='checkpoint_final.pth',
     )
-    print(f"  Loaded model: {config}/fold_{fold}")
+    print(f"  Loaded model: {epochs}/{config}/fold_{fold}")
 
 
 def predict_single_case(
@@ -496,17 +498,17 @@ def run_inference_batch(
         predictor.use_mirroring = use_tta
 
     tta_status = "TTA" if use_tta else "no-TTA"
-    model_desc = ", ".join(f"{cfg}/{fold}" for cfg, fold, _ in MODEL_CONFIGS)
+    model_desc = ", ".join(f"{epochs}/{cfg}/{fold}" for epochs, cfg, fold, _ in MODEL_CONFIGS)
     print(f"  Models: {model_desc} ({tta_status})")
 
     # Run all model configs in parallel
-    result_queues = {(config, fold): Queue() for config, fold, _ in MODEL_CONFIGS}
+    result_queues = {(epochs, config, fold): Queue() for epochs, config, fold, _ in MODEL_CONFIGS}
     threads = []
 
-    for config, fold, _ in MODEL_CONFIGS:
-        predictor = predictors[(config, fold)]
+    for epochs, config, fold, _ in MODEL_CONFIGS:
+        predictor = predictors[(epochs, config, fold)]
 
-        def process_model(pred, imgs, cfg, fld, queue):
+        def process_model(pred, imgs, ep, cfg, fld, queue):
             try:
                 for img_path in imgs:
                     case_id = img_path.stem
@@ -514,26 +516,26 @@ def run_inference_batch(
                     queue.put((case_id, probs, None))
             except Exception as e:
                 import traceback
-                queue.put((None, None, f"{cfg}/{fld}: {e}\n{traceback.format_exc()}"))
+                queue.put((None, None, f"{ep}/{cfg}/{fld}: {e}\n{traceback.format_exc()}"))
 
         t = threading.Thread(
             target=process_model,
-            args=(predictor, batch_images, config, fold, result_queues[(config, fold)])
+            args=(predictor, batch_images, epochs, config, fold, result_queues[(epochs, config, fold)])
         )
         threads.append(t)
         t.start()
 
     # Collect results
-    model_results = {(cfg, fold): {} for cfg, fold, _ in MODEL_CONFIGS}  # (config, fold) -> {case_id: probs}
+    model_results = {(epochs, cfg, fold): {} for epochs, cfg, fold, _ in MODEL_CONFIGS}  # (epochs, config, fold) -> {case_id: probs}
     errors = []
 
-    for config, fold, _ in MODEL_CONFIGS:
+    for epochs, config, fold, _ in MODEL_CONFIGS:
         for _ in range(n_cases):
-            case_id, probs, error = result_queues[(config, fold)].get()
+            case_id, probs, error = result_queues[(epochs, config, fold)].get()
             if error:
                 errors.append(error)
             else:
-                model_results[(config, fold)][case_id] = probs
+                model_results[(epochs, config, fold)][case_id] = probs
 
     for t in threads:
         t.join()
@@ -546,9 +548,9 @@ def run_inference_batch(
     # Accumulate weighted probabilities
     for img_path in batch_images:
         case_id = img_path.stem
-        for config, fold, _ in MODEL_CONFIGS:
-            model_weight = MODEL_WEIGHTS[(config, fold)]
-            weighted_probs = model_results[(config, fold)][case_id] * model_weight
+        for epochs, config, fold, _ in MODEL_CONFIGS:
+            model_weight = MODEL_WEIGHTS[(epochs, config, fold)]
+            weighted_probs = model_results[(epochs, config, fold)][case_id] * model_weight
 
             if batch_cumulative[case_id] is None:
                 batch_cumulative[case_id] = weighted_probs
@@ -578,21 +580,21 @@ def run_inference_batch(
 
 
 def initialize_all_predictors() -> dict:
-    """Initialize predictors for specific config/fold combinations.
+    """Initialize predictors for specific (epochs, config, fold) combinations.
 
     Returns:
-        Dict mapping (config, fold) -> nnUNetPredictor with model loaded
+        Dict mapping (epochs, config, fold) -> nnUNetPredictor with model loaded
     """
     predictors = {}
 
-    for idx, (config, fold, _) in enumerate(MODEL_CONFIGS):
+    for idx, (epochs, config, fold, _) in enumerate(MODEL_CONFIGS):
         gpu_id = idx % 2  # Distribute across 2 GPUs
-        print(f"Loading model: {config}/fold_{fold} on GPU {gpu_id}")
+        print(f"Loading model: {epochs}/{config}/fold_{fold} on GPU {gpu_id}")
 
         # TTA setting controlled by ENABLE_TTA flag
         predictor = create_predictor(gpu_id, use_tta=ENABLE_TTA)
-        load_model(predictor, config, fold)
-        predictors[(config, fold)] = predictor
+        load_model(predictor, epochs, config, fold)
+        predictors[(epochs, config, fold)] = predictor
 
     return predictors
 
@@ -626,7 +628,7 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 def main():
     print("=" * 60)
     print("Vesuvius nnUNet Submission (Python API - Weighted Ensemble)")
-    model_desc = ", ".join(f"{cfg}/fold_{fold}" for cfg, fold, _ in MODEL_CONFIGS)
+    model_desc = ", ".join(f"{epochs}/{cfg}/fold_{fold}" for epochs, cfg, fold, _ in MODEL_CONFIGS)
     print(f"Models: {model_desc}")
     print(f"Total models: {len(MODEL_CONFIGS)}")
     print(f"Model weights: {MODEL_WEIGHTS}")

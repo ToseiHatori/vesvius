@@ -79,10 +79,10 @@ PLANS = "nnUNetResEncUNetMPlans"
 # Each entry: (epochs, config, fold, weight)
 # Weights are normalized automatically if they don't sum to 1.0
 MODEL_CONFIGS = [
-    ("4000epochs", "3d_fullres", "0", 0.30),   # 4000epoch fullres fold0
-    ("2000epochs", "3d_fullres", "1", 0.30),   # 2000epoch fullres fold1
-    ("2000epochs", "3d_lowres", "0", 0.20),    # 2000epoch lowres fold0
-    ("4000epochs", "3d_lowres", "1", 0.20),    # 4000epoch lowres fold1
+    ("4000epochs", "3d_fullres", "0", 0.35),   # 4000epoch fullres fold0
+    ("2000epochs", "3d_fullres", "1", 0.25),   # 2000epoch fullres fold1
+    ("2000epochs", "3d_lowres", "0", 0.15),    # 2000epoch lowres fold0
+    ("4000epochs", "3d_lowres", "1", 0.25),    # 4000epoch lowres fold1
 ]
 
 # Normalize weights to sum to 1.0
@@ -96,7 +96,7 @@ TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
 BATCH_SIZE = 5  # Number of cases to process before ensemble/postprocess
 
 # TTA settings
-ENABLE_TTA = False  # Set True to enable adaptive TTA, False for no TTA (faster)
+ENABLE_TTA = True  # Set True to enable adaptive TTA, False for no TTA (faster)
 KAGGLE_TIME_LIMIT_SECONDS = 9 * 60 * 60  # 9 hours
 TTA_SPEEDUP_FACTOR = 8  # TTA is ~8x slower than non-TTA
 SAFETY_MARGIN_SECONDS = 5 * 60  # 5 minutes safety buffer

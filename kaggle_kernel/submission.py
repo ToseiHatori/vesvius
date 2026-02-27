@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Vesuvius Surface Detection - Kaggle Submission Script
-nnUNet weighted ensemble: 3d_fullres/fold_0 (60%) + 3d_lowres/fold_1 (40%), 2x T4 GPU, opening+closing post-processing
+nnUNet weighted ensemble: 4 models (fullres/lowres x fold0/fold1), 2x T4 GPU, opening+closing post-processing
 
 Optimized with Python API for faster inference:
 - Model loaded once per (config, fold) combination
 - Parallel inference on 2 GPUs
-- Weighted ensemble: 60% fullres + 40% lowres (optimized via logloss)
+- Weighted ensemble: configurable weights per (config, fold) combination
 - TTA: configurable via ENABLE_TTA flag (adaptive or disabled)
 """
 
@@ -75,14 +75,20 @@ DATASET_NAME = f"Dataset{DATASET_ID:03d}_VesuviusSurface"
 TRAINER = "nnUNetTrainer"
 PLANS = "nnUNetResEncUNetMPlans"
 
-# Specific config+fold combinations to use
-# Each tuple: (config, fold)
+# Model configurations with individual weights
+# Each entry: (config, fold, weight)
+# Weights are normalized automatically if they don't sum to 1.0
 MODEL_CONFIGS = [
-    ("3d_fullres", "0"),   # 2000epoch fullres fold0
-    ("3d_lowres", "1"),    # 2000epoch lowres fold1
+    ("3d_fullres", "0", 0.30),   # 2000epoch fullres fold0
+    ("3d_fullres", "1", 0.30),   # 2000epoch fullres fold1
+    ("3d_lowres", "0", 0.20),    # 2000epoch lowres fold0
+    ("3d_lowres", "1", 0.20),    # 2000epoch lowres fold1
 ]
-CONFIGS = list(set(cfg[0] for cfg in MODEL_CONFIGS))  # Unique configs for setup
-CONFIG_WEIGHTS = {"3d_lowres": 0.4, "3d_fullres": 0.6}  # Optimized via logloss
+
+# Normalize weights to sum to 1.0
+_weight_sum = sum(w for _, _, w in MODEL_CONFIGS)
+MODEL_WEIGHTS = {(cfg, fold): w / _weight_sum for cfg, fold, w in MODEL_CONFIGS}
+CONFIGS = list(set(cfg for cfg, _, _ in MODEL_CONFIGS))  # Unique configs for setup
 
 # Inference settings
 TILE_STEP_SIZE = 0.3  # Sliding window step size (0.3 = 70% overlap)
@@ -337,7 +343,7 @@ def setup_environment():
         print(f"Symlink: {trainer_dir} -> {MODEL_DATASET_DIR / config}")
 
     # Verify only the specific config+fold combinations we're using
-    for config, fold in MODEL_CONFIGS:
+    for config, fold, _ in MODEL_CONFIGS:
         trainer_dir = dataset_dir / f"{TRAINER}__{PLANS}__{config}"
         model_dir = trainer_dir / f"fold_{fold}"
         checkpoint = model_dir / "checkpoint_final.pth"
@@ -490,14 +496,14 @@ def run_inference_batch(
         predictor.use_mirroring = use_tta
 
     tta_status = "TTA" if use_tta else "no-TTA"
-    model_desc = ", ".join(f"{cfg}/{fold}" for cfg, fold in MODEL_CONFIGS)
+    model_desc = ", ".join(f"{cfg}/{fold}" for cfg, fold, _ in MODEL_CONFIGS)
     print(f"  Models: {model_desc} ({tta_status})")
 
     # Run all model configs in parallel
-    result_queues = {(config, fold): Queue() for config, fold in MODEL_CONFIGS}
+    result_queues = {(config, fold): Queue() for config, fold, _ in MODEL_CONFIGS}
     threads = []
 
-    for config, fold in MODEL_CONFIGS:
+    for config, fold, _ in MODEL_CONFIGS:
         predictor = predictors[(config, fold)]
 
         def process_model(pred, imgs, cfg, fld, queue):
@@ -518,10 +524,10 @@ def run_inference_batch(
         t.start()
 
     # Collect results
-    model_results = {key: {} for key in MODEL_CONFIGS}  # (config, fold) -> {case_id: probs}
+    model_results = {(cfg, fold): {} for cfg, fold, _ in MODEL_CONFIGS}  # (config, fold) -> {case_id: probs}
     errors = []
 
-    for config, fold in MODEL_CONFIGS:
+    for config, fold, _ in MODEL_CONFIGS:
         for _ in range(n_cases):
             case_id, probs, error = result_queues[(config, fold)].get()
             if error:
@@ -540,9 +546,9 @@ def run_inference_batch(
     # Accumulate weighted probabilities
     for img_path in batch_images:
         case_id = img_path.stem
-        for config, fold in MODEL_CONFIGS:
-            config_weight = CONFIG_WEIGHTS[config]
-            weighted_probs = model_results[(config, fold)][case_id] * config_weight
+        for config, fold, _ in MODEL_CONFIGS:
+            model_weight = MODEL_WEIGHTS[(config, fold)]
+            weighted_probs = model_results[(config, fold)][case_id] * model_weight
 
             if batch_cumulative[case_id] is None:
                 batch_cumulative[case_id] = weighted_probs
@@ -555,7 +561,7 @@ def run_inference_batch(
     # Finalize: post-process (weights already sum to 1.0)
     for img_path in batch_images:
         case_id = img_path.stem
-        # Weighted average: 0.6 * fullres + 0.4 * lowres = 1.0 total weight
+        # Weighted average (weights normalized to sum to 1.0)
         avg_probs = batch_cumulative[case_id]
         pred = postprocess_opening_closing(avg_probs)
         tifffile.imwrite(output_dir / f"{case_id}.tif", pred)
@@ -579,7 +585,7 @@ def initialize_all_predictors() -> dict:
     """
     predictors = {}
 
-    for idx, (config, fold) in enumerate(MODEL_CONFIGS):
+    for idx, (config, fold, _) in enumerate(MODEL_CONFIGS):
         gpu_id = idx % 2  # Distribute across 2 GPUs
         print(f"Loading model: {config}/fold_{fold} on GPU {gpu_id}")
 
@@ -620,16 +626,16 @@ def create_submission_zip(predictions_dir: Path, output_zip: Path) -> Path:
 def main():
     print("=" * 60)
     print("Vesuvius nnUNet Submission (Python API - Weighted Ensemble)")
-    model_desc = ", ".join(f"{cfg}/fold_{fold}" for cfg, fold in MODEL_CONFIGS)
+    model_desc = ", ".join(f"{cfg}/fold_{fold}" for cfg, fold, _ in MODEL_CONFIGS)
     print(f"Models: {model_desc}")
     print(f"Total models: {len(MODEL_CONFIGS)}")
-    print(f"Config weights: {CONFIG_WEIGHTS}")
+    print(f"Model weights: {MODEL_WEIGHTS}")
     print(f"TTA: {'adaptive' if ENABLE_TTA else 'disabled'}")
     print(f"Time limit: {KAGGLE_TIME_LIMIT_SECONDS/3600:.1f}h (safety margin: {SAFETY_MARGIN_SECONDS/60:.0f}min)")
     print(f"Tile step size: {TILE_STEP_SIZE}")
     print(f"Batch size: {BATCH_SIZE}")
     print(f"Post-processing: {'opening+closing' if USE_HYSTERESIS else 'argmax'}")
-    print(f"Ensemble: weighted probability averaging (40% lowres + 60% fullres)")
+    print(f"Ensemble: weighted probability averaging")
     print(f"Optimization: Model loaded once per (config, fold), not per case")
     print("=" * 60)
 

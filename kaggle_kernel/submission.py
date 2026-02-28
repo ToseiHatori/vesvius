@@ -79,10 +79,10 @@ PLANS = "nnUNetResEncUNetMPlans"
 # Each entry: (epochs, config, fold, weight)
 # Weights are normalized automatically if they don't sum to 1.0
 MODEL_CONFIGS = [
-    ("4000epochs", "3d_fullres", "0", 0.35),   # 4000epoch fullres fold0
-    ("2000epochs", "3d_fullres", "1", 0.25),   # 2000epoch fullres fold1
-    ("2000epochs", "3d_lowres", "0", 0.15),    # 2000epoch lowres fold0
-    ("4000epochs", "3d_lowres", "1", 0.25),    # 4000epoch lowres fold1
+    ("4000epochs", "3d_fullres", "0", 0.40),   # 4000epoch fullres fold0
+    ("2000epochs", "3d_fullres", "1", 0.20),   # 2000epoch fullres fold1
+    ("2000epochs", "3d_lowres", "0", 0.10),    # 2000epoch lowres fold0
+    ("4000epochs", "3d_lowres", "1", 0.30),    # 4000epoch lowres fold1
 ]
 
 # Normalize weights to sum to 1.0
